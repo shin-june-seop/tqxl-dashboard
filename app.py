@@ -85,7 +85,6 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 내 포트폴리오 & 시그널", "📝 
 with tab1:
     st.subheader("💰 내 포트폴리오 자산 현황")
     
-    # Supabase 매매기록 기반 보유자산 계산
     tqqq_price = float(df_tqqq['Close'].iloc[-1]) if not df_tqqq.empty else 0
     soxl_price = float(df_soxl['Close'].iloc[-1]) if not df_soxl.empty else 0
     
@@ -94,14 +93,12 @@ with tab1:
         if logs.data:
             df_logs = pd.DataFrame(logs.data)
             
-            # TQQQ / SOXL 각각 평가계산
             summary_list = []
             total_eval_krw, total_buy_krw = 0, 0
             
             for tk, cur_p in [("TQQQ", tqqq_price), ("SOXL", soxl_price)]:
                 df_tk = df_logs[df_logs['ticker'] == tk]
                 if not df_tk.empty:
-                    # 매수/매도 수량 누적
                     buys = df_tk[df_tk['trade_type'] == '매수']
                     sells = df_tk[df_tk['trade_type'] == '매도']
                     
@@ -132,7 +129,6 @@ with tab1:
             total_profit_krw = total_eval_krw - total_buy_krw
             total_return_pct = (total_profit_krw / total_buy_krw) * 100 if total_buy_krw > 0 else 0
             
-            # 포트폴리오 상단 4개 카드로 한눈에 표기
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("총 평가 자산 (원)", f"{total_eval_krw:,.0f}원")
             c2.metric("총 매수 원금 (원)", f"{total_buy_krw:,.0f}원")
@@ -148,7 +144,6 @@ with tab1:
 
     st.markdown("---")
     
-    # 시장 상태 및 시그널 알림
     if not df_base.empty and not df_lev.empty and len(df_base) >= 200:
         last_base_price = float(df_base['Close'].iloc[-1])
         last_base_200ma = float(df_base['200MA'].iloc[-1])
@@ -164,7 +159,6 @@ with tab1:
         sc2.metric(f"{base_ticker} 200일선", f"${last_base_200ma:.2f}")
         sc3.metric(f"{base_ticker} 200일선 이격도", f"{base_disparity:+.2f}%")
 
-        # 시그널 판정
         is_emergency_2 = base_disparity <= emergency_2
         is_emergency_1 = base_disparity <= emergency_1 and not is_emergency_2
         is_bubble = lev_disparity >= bubble_limit
@@ -233,7 +227,7 @@ with tab2:
                 "memo": t_memo
             }
             supabase.table("trade_logs").insert(data).execute()
-            st.success("✅ Supabase DB에 저장 완료! (첫번째 탭에서 실시간 업데이트 확인 가능)")
+            st.success("✅ Supabase DB에 저장 완료!")
 
     st.markdown("---")
     st.subheader("📋 저장된 매매 기록")
@@ -248,14 +242,33 @@ with tab2:
     except Exception as e:
         st.warning("매매일지 데이터를 불러오는 중입니다.")
 
-# [TAB 3] 차트 오버레이
+# [TAB 3] 차트 오버레이 (선 색상 및 스타일 시각적 명확화)
 with tab3:
     st.subheader(f"📈 {base_ticker} & {lev_ticker} 200일선 차트")
     if not df_base.empty:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_base.index, y=df_base['Close'], name=f'{base_ticker} 주가', line=dict(color='white')))
-        fig.add_trace(go.Scatter(x=df_base.index, y=df_base['200MA'], name=f'{base_ticker} 200일선', line=dict(color='yellow', dash='dash')))
-        fig.update_layout(height=500, template="plotly_dark")
+        
+        # 1. 주가 선 (밝은 청록색, 선 두께 2)
+        fig.add_trace(go.Scatter(
+            x=df_base.index, 
+            y=df_base['Close'], 
+            name=f'{base_ticker} 주가', 
+            line=dict(color='#00FFFF', width=2)
+        ))
+        
+        # 2. 200일 이동평균선 (선명한 주황색, 점선 스타일)
+        fig.add_trace(go.Scatter(
+            x=df_base.index, 
+            y=df_base['200MA'], 
+            name=f'{base_ticker} 200일선', 
+            line=dict(color='#FF9900', width=2, dash='dash')
+        ))
+        
+        fig.update_layout(
+            height=500, 
+            template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 # [TAB 4] 상세 전략 규칙 안내
