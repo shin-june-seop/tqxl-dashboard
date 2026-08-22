@@ -16,7 +16,7 @@ try:
 except Exception:
     create_client = None
 
-st.set_page_config(page_title="Leveraged Strategy Dashboard V1.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Leveraged Strategy Dashboard V1.2.2", page_icon="📈", layout="wide")
 
 STRATEGIES = {
     "TQQQ / QQQ": {
@@ -215,7 +215,7 @@ prices = {t: float(df["close"].iloc[-1]) for t, df in prices_data.items() if not
 
 # ---------- Strategy dashboard ----------
 if page == "전략 대시보드":
-    st.title("📈 Leveraged Strategy Dashboard V1.1")
+    st.title("📈 Leveraged Strategy Dashboard V1.2")
     st.caption("매일 계산 · 2주마다 판정 · 급락 시 즉시 비상 대응")
 
     states = {n: strategy_state(n, prices_data) for n in STRATEGIES}
@@ -347,3 +347,34 @@ else:
             cmp["목표 비중"] = cmp["목표 비중"].map(lambda x:f"{x:.0f}%" if pd.notna(x) else "-")
             cmp["차이"] = cmp["차이"].map(lambda x:f"{x:+.1f}%p" if pd.notna(x) else "-")
             st.dataframe(cmp[["ticker","실제 비중","목표 비중","차이","행동"]].rename(columns={"ticker":"종목"}), use_container_width=True, hide_index=True)
+
+st.divider()
+
+st.subheader("📜 Strategy Rules")
+st.caption("현재 적용 중인 전체 전략 규칙을 언제든 확인할 수 있습니다.")
+
+def show_rules(name, s):
+    cfg = s["cfg"]
+    lev, und = cfg["leveraged"], cfg["underlying"]
+    df = pd.DataFrame([
+        {"현재":"","단계":"🟢 1단계 · 강세장","조건":f"{und} 200MA 위 2회 연속",lev:f"{cfg['weights'][1]}%","현금":f"{100-cfg['weights'][1]}%","행동":"적극 보유"},
+        {"현재":"","단계":"🟡 2단계 · 초기 하락","조건":f"{und} 200MA 첫 이탈",lev:f"{cfg['weights'][2]}%","현금":f"{100-cfg['weights'][2]}%","행동":"비중 축소"},
+        {"현재":"","단계":"🟠 3단계 · 진성 하락","조건":f"200MA 아래 3회 연속 OR 이격도 {cfg['stage3_gap']:.0f}% 이하",lev:f"{cfg['weights'][3]}%","현금":f"{100-cfg['weights'][3]}%","행동":"방어"},
+        {"현재":"","단계":"🔴 4단계 · 시발","조건":f"{und} 200MA 대비 {cfg['stage4_gap']:.0f}% 이하",lev:f"{cfg['weights'][4]}%","현금":f"{100-cfg['weights'][4]}%","행동":"강력 방어"},
+        {"현재":"","단계":"🔵 상승 복귀 · 2주차","조건":f"{und} 200MA 재돌파 후 2주차",lev:f"{cfg['weights']['recovery']}%","현금":f"{100-cfg['weights']['recovery']}%","행동":"단계적 재진입"},
+    ])
+    idx = {1:0,2:1,3:2,4:3,"recovery":4}.get(s["stage"])
+    if idx is not None: df.loc[idx,"현재"]="◀ 현재 적용"
+    def hl(row):
+        return ["font-weight:700" if row["현재"]=="◀ 현재 적용" else "" for _ in row]
+    st.markdown(f"### {name}")
+    st.dataframe(df.style.apply(hl,axis=1), use_container_width=True, hide_index=True)
+    st.markdown(f"**🚨 月중 비상 대응:** {und} ≤ {cfg['emergency'][0][0]:.0f}% → {lev} **{cfg['emergency'][0][1]}%** · {und} ≤ {cfg['emergency'][1][0]:.0f}% → {lev} **{cfg['emergency'][1][1]}%**")
+    st.markdown(f"**🔥 버블 보험:** {lev}가 자기 200MA 대비 **+{cfg['bubble']:.0f}% 이상**이면 주식 비중 **60%까지 축소 검토**")
+
+show_rules("TQQQ / QQQ", states["TQQQ / QQQ"])
+show_rules("SOXL / SOXX", states["SOXL / SOXX"])
+
+st.info("📌 **운용 원칙:** 매일 계산 → **2주마다 판정** → 급락 시 **즉시 비상 대응**. 정상적인 시장에서는 2주마다 한 번만 비중을 조절하고, 비상 기준에 도달하면 다음 판정일까지 기다리지 않습니다.")
+
+
