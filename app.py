@@ -1,802 +1,380 @@
-from datetime import datetime, date
+
 import os
-import json
-import pandas as pd
-import streamlit as st
-from supabase import create_client
-from pathlib import Path
+from datetime import datetime, timedelta
 
 import numpy as np
+import pandas as pd
+import streamlit as st
 
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
-# ===== V14 FX-aware transaction ledger =====
-def v14_normalize_transactions(tx):
-    tx = tx.copy() if tx is not None else pd.DataFrame()
-    defaults = {
-        "date": "", "ticker": "", "type": "BUY", "shares": 0.0,
-        "price": 0.0, "fx_rate": 0.0, "fee_usd": 0.0, "note": ""
-    }
-    for col, default in defaults.items():
-        if col not in tx.columns:
-            tx[col] = default
-    for col in ["shares", "price", "fx_rate", "fee_usd"]:
-        tx[col] = pd.to_numeric(tx[col], errors="coerce").fillna(0.0)
-    tx["type"] = tx["type"].astype(str).str.upper().replace({"매수": "BUY", "매도": "SELL"})
-    tx["ticker"] = tx["ticker"].astype(str).str.upper()
-    tx["date"] = tx["date"].astype(str)
-    return tx
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
 
-def v14_realized_fx_pnl(tx):
-    """FIFO: decompose realized KRW P/L into stock-price and FX effects."""
-    tx = v14_normalize_transactions(tx)
-    if tx.empty:
-        return pd.DataFrame()
+st.set_page_config(page_title="Leveraged Strategy Dashboard V1.2.2", page_icon="📈", layout="wide")
 
-    result = []
-    for ticker in tx["ticker"].dropna().unique():
-        lots = []
-        rows = tx[tx["ticker"] == ticker].sort_values("date")
+STRATEGIES = {
+    "TQQQ / QQQ": {
+        "underlying": "QQQ", "leveraged": "TQQQ",
+        "bubble": 30.0, "stage3_gap": -12.0, "stage4_gap": -25.0,
+        "weights": {1: 80, 2: 60, 3: 30, 4: 15, "recovery": 60},
+        "emergency": [(-15.0, 30), (-25.0, 15)],
+    },
+    "SOXL / SOXX": {
+        "underlying": "SOXX", "leveraged": "SOXL",
+        "bubble": 40.0, "stage3_gap": -15.0, "stage4_gap": -25.0,
+        "weights": {1: 80, 2: 40, 3: 20, 4: 10, "recovery": 60},
+        "emergency": [(-20.0, 20), (-30.0, 10)],
+    },
+}
 
-        for _, r in rows.iterrows():
-            qty = float(r["shares"])
-            sell_or_buy_price = float(r["price"])
-            fx = float(r["fx_rate"])
-            if qty <= 0 or sell_or_buy_price <= 0 or fx <= 0:
-                continue
-
-            if r["type"] == "BUY":
-                lots.append([qty, sell_or_buy_price, fx, str(r["date"])])
-                continue
-
-            if r["type"] != "SELL":
-                continue
-
-            remain = qty
-            while remain > 1e-10 and lots:
-                lot_qty, buy_price, buy_fx, buy_date = lots[0]
-                used = min(remain, lot_qty)
-
-                stock_pnl = used * (sell_or_buy_price - buy_price) * buy_fx
-                fx_pnl = used * sell_or_buy_price * (fx - buy_fx)
-                total_pnl = (
-                    used * sell_or_buy_price * fx
-                    - used * buy_price * buy_fx
-                )
-
-                result.append({
-                    "date": str(r["date"]),
-                    "ticker": ticker,
-                    "shares": used,
-                    "buy_price_usd": buy_price,
-                    "sell_price_usd": sell_or_buy_price,
-                    "buy_fx": buy_fx,
-                    "sell_fx": fx,
-                    "stock_pnl_krw": stock_pnl,
-                    "fx_pnl_krw": fx_pnl,
-                    "total_pnl_krw": total_pnl,
-                    "stock_return_pct": (sell_or_buy_price / buy_price - 1) * 100,
-                    "fx_return_pct": (fx / buy_fx - 1) * 100,
-                    "total_return_pct": (
-                        (sell_or_buy_price * fx) / (buy_price * buy_fx) - 1
-                    ) * 100
-                })
-
-                lot_qty -= used
-                remain -= used
-                if lot_qty <= 1e-10:
-                    lots.pop(0)
-                else:
-                    lots[0][0] = lot_qty
-
-    return pd.DataFrame(result)
-
-
-# ============================================================
-# V15 CLOUD STORAGE
-# Uses Supabase when configured; local CSV remains available
-# for offline/local use. Supabase credentials belong in
-# Streamlit Secrets and must never be committed to GitHub.
-# ============================================================
-def v15_get_supabase():
-    """Create a server-side Supabase client.
-    Prefer SUPABASE_SECRET_KEY (never expose it to the browser).
-    SUPABASE_KEY remains as a compatibility fallback.
-    """
+# ---------- Supabase ----------
+def get_supabase():
+    if create_client is None:
+        return None
     try:
         url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
-        key = st.secrets.get(
-            "SUPABASE_SECRET_KEY",
-            os.getenv("SUPABASE_SECRET_KEY", "")
-        )
-        if not key:
-            key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+        key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
         if url and key:
             return create_client(url, key)
     except Exception:
-        pass
+        return None
     return None
 
-def v15_empty_transactions():
-    return pd.DataFrame({
-        "date": pd.Series(dtype="string"),
-        "ticker": pd.Series(dtype="string"),
-        "type": pd.Series(dtype="string"),
-        "shares": pd.Series(dtype="float64"),
-        "price": pd.Series(dtype="float64"),
-        "fx_rate": pd.Series(dtype="float64"),
-        "fee_usd": pd.Series(dtype="float64"),
-        "note": pd.Series(dtype="string"),
-    })
+sb = get_supabase()
 
-def v15_load_transactions():
-    sb = v15_get_supabase()
-    if sb is not None:
+def db_select(table, order_col="id"):
+    if sb is None:
+        return []
+    try:
+        return sb.table(table).select("*").order(order_col).execute().data or []
+    except Exception:
+        return []
+
+def db_insert(table, payload):
+    if sb is None:
+        return False, "Supabase 연결이 없습니다."
+    try:
+        sb.table(table).insert(payload).execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def db_delete(table, row_id):
+    if sb is None:
+        return False, "Supabase 연결이 없습니다."
+    try:
+        sb.table(table).delete().eq("id", row_id).execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+# ---------- Market data ----------
+@st.cache_data(ttl=900)
+def load_prices(tickers):
+    if yf is None:
+        return {}
+    end = datetime.now()
+    start = end - timedelta(days=900)
+    raw = yf.download(
+        tickers, start=start.strftime("%Y-%m-%d"),
+        end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+        auto_adjust=False, progress=False, group_by="ticker", threads=True,
+    )
+    result = {}
+    for ticker in tickers:
         try:
-            res = sb.table("transactions").select(
-                "date,ticker,type,shares,price,fx_rate,fee_usd,note"
-            ).order("date").execute()
-            return v14_normalize_transactions(
-                pd.DataFrame(res.data or [])
-            )
+            df = raw[ticker].copy() if isinstance(raw.columns, pd.MultiIndex) else raw.copy()
+            df.columns = [str(c).lower() for c in df.columns]
+            df = df[["close"]].dropna()
+            df["ma200"] = df["close"].rolling(200).mean()
+            df["gap"] = (df["close"] / df["ma200"] - 1) * 100
+            result[ticker] = df
         except Exception:
-            st.warning("클라우드 거래내역을 읽지 못했습니다. 로컬 데이터를 사용합니다.")
-    path = Path("transactions.csv")
-    try:
-        return v14_normalize_transactions(
-            pd.read_csv(path) if path.exists() else v15_empty_transactions()
-        )
-    except Exception:
-        return v15_empty_transactions()
+            result[ticker] = pd.DataFrame()
+    return result
 
-def v15_save_transactions(tx):
-    tx = v14_normalize_transactions(tx).copy()
-    tx = tx[[
-        "date", "ticker", "type", "shares",
-        "price", "fx_rate", "fee_usd", "note"
-    ]]
-    sb = v15_get_supabase()
-    if sb is not None:
-        try:
-            records = tx.where(pd.notna(tx), None).to_dict(orient="records")
-            sb.table("transactions").delete().neq("id", -1).execute()
-            if records:
-                sb.table("transactions").insert(records).execute()
-            return True, "클라우드(Supabase)에 저장했습니다."
-        except Exception as e:
-            return False, f"클라우드 저장 실패: {e}"
-    tx.to_csv("transactions.csv", index=False)
-    return True, "PC의 transactions.csv에 저장했습니다."
+def biweekly_snapshots(df, count=8):
+    valid = df.dropna(subset=["ma200"]).copy()
+    if valid.empty: return pd.DataFrame()
+    target = valid.index[-1]
+    rows = []
+    for _ in range(count):
+        c = valid.loc[valid.index <= target]
+        if c.empty: break
+        row = c.iloc[-1].copy()
+        row.name = c.index[-1]
+        rows.append(row)
+        target = row.name - pd.Timedelta(days=14)
+    return pd.DataFrame(rows[::-1])
 
-def v15_cloud_status():
-    return v15_get_supabase() is not None
+def strategy_state(name, data):
+    cfg = STRATEGIES[name]
+    u, l = data[cfg["underlying"]], data[cfg["leveraged"]]
+    if u.empty or l.empty: return {"error": f"{cfg['underlying']} / {cfg['leveraged']} 데이터를 가져오지 못했습니다."}
+    snaps = biweekly_snapshots(u, 8)
+    if snaps.empty: return {"error": "200일 이동평균 데이터가 부족합니다."}
+    gap = float(snaps.iloc[-1]["gap"])
+    above = (snaps["gap"] >= 0).tolist()
+    below = (snaps["gap"] < 0).tolist()
+    ca = 0
+    for x in reversed(above):
+        if x: ca += 1
+        else: break
+    cb = 0
+    for x in reversed(below):
+        if x: cb += 1
+        else: break
+    prev_gap = float(snaps.iloc[-2]["gap"]) if len(snaps) >= 2 else np.nan
+    recross = gap >= 0 and not np.isnan(prev_gap) and prev_gap < 0
 
-
-# ============================================================
-# V16 Portfolio Intelligence Engine
-# ============================================================
-V16_STOP_LOSS_PCT = -32.0
-V16_TRAILING_STOP_PCT = -10.0
-V16_PARTIAL_SELL_PCT = 30.0
-
-V16_CATEGORY_MAP = {
-    "NVDA":"AI / GPU","AVGO":"AI / Networking","MSFT":"AI / Software",
-    "GOOG":"AI / Software","AMZN":"AI / Cloud","META":"AI / Software",
-    "MU":"Memory","WDC":"Memory","SNDK":"Memory",
-    "ANET":"Networking","MRVL":"Networking",
-    "VRT":"Power / Data Center","NVT":"Power / Data Center",
-    "COHR":"Optical","GLW":"Optical",
-    "KLAC":"Semiconductor Equipment","LRCX":"Semiconductor Equipment",
-    "AMAT":"Semiconductor Equipment","ASML":"Semiconductor Equipment",
-    "PANW":"Cybersecurity","CRWD":"Cybersecurity",
-    "AAPL":"Mega Cap Tech","QQQ":"ETF","TQQQ":"ETF",
-    "UPRO":"ETF","SOXL":"ETF","QLD":"ETF"
-}
-
-def v16_num(v, default=0.0):
-    try:
-        x = float(v)
-        return default if pd.isna(x) else x
-    except Exception:
-        return default
-
-def v16_category(ticker, fallback="Other"):
-    return V16_CATEGORY_MAP.get(str(ticker).upper(), fallback)
-
-def v16_tx_normalize(tx):
-    if tx is None or tx.empty:
-        return pd.DataFrame(columns=["date","ticker","type","shares","price","fx_rate"])
-    x = tx.copy()
-    ren = {}
-    for c in x.columns:
-        lc = str(c).lower()
-        if lc in ("종목","ticker","symbol"): ren[c]="ticker"
-        elif lc in ("구분","type","side"): ren[c]="type"
-        elif lc in ("수량","shares","qty"): ren[c]="shares"
-        elif lc in ("주가","price","매수가","매도가"): ren[c]="price"
-        elif lc in ("환율","fx_rate","fx"): ren[c]="fx_rate"
-        elif lc in ("날짜","date"): ren[c]="date"
-    x=x.rename(columns=ren)
-    for c in ["date","ticker","type","shares","price","fx_rate"]:
-        if c not in x.columns: x[c] = "" if c in ["date","ticker","type"] else 0
-    x["ticker"]=x["ticker"].astype(str).str.upper().str.strip()
-    x["type"]=x["type"].astype(str).str.upper().str.strip()
-    x["shares"]=pd.to_numeric(x["shares"],errors="coerce").fillna(0)
-    x["price"]=pd.to_numeric(x["price"],errors="coerce").fillna(0)
-    x["fx_rate"]=pd.to_numeric(x["fx_rate"],errors="coerce").fillna(0)
-    x["date"]=pd.to_datetime(x["date"],errors="coerce")
-    return x.sort_values(["date"]).reset_index(drop=True)
-
-def v16_build_holdings(tx, fallback=None):
-    x=v16_tx_normalize(tx)
-    if x.empty:
-        if fallback is not None and not fallback.empty:
-            f=fallback.copy()
-            f["ticker"]=f["ticker"].astype(str).str.upper()
-            for c in ["shares","avg_price"]:
-                if c not in f: f[c]=0
-            f["category"]=f["ticker"].map(v16_category)
-            f["avg_fx"]=0.0
-            return f[["ticker","shares","avg_price","avg_fx","category"]]
-        return pd.DataFrame(columns=["ticker","shares","avg_price","avg_fx","category"])
-    out=[]
-    for ticker, g in x.groupby("ticker", sort=True):
-        lots=[]
-        for _,r in g.iterrows():
-            q=v16_num(r.shares); p=v16_num(r.price); fx=v16_num(r.fx_rate)
-            if q<=0 or p<=0: continue
-            if r["type"]=="BUY":
-                lots.append([q,p,fx])
-            elif r["type"]=="SELL":
-                rem=q
-                while rem>1e-9 and lots:
-                    take=min(rem,lots[0][0])
-                    lots[0][0]-=take; rem-=take
-                    if lots[0][0]<=1e-9: lots.pop(0)
-        shares=sum(z[0] for z in lots)
-        if shares>1e-9:
-            avg=sum(z[0]*z[1] for z in lots)/shares
-            avg_fx=sum(z[0]*z[2] for z in lots)/shares if any(z[2] for z in lots) else 0
-            out.append({"ticker":ticker,"shares":shares,"avg_price":avg,
-                        "avg_fx":avg_fx,"category":v16_category(ticker)})
-    return pd.DataFrame(out)
-
-def v16_market_data(tickers, fallback):
-    data={}
-    static={}
-    if fallback is not None and not fallback.empty:
-        for _,r in fallback.iterrows():
-            static[str(r.get("ticker","")).upper()]=v16_num(r.get("current_price",r.get("price",r.get("avg_price",0))))
-    try:
-        import yfinance as yf
-        for t in tickers:
-            try:
-                h=yf.Ticker(t).history(period="2y", auto_adjust=True)
-                if h is None or h.empty: continue
-                close=h["Close"].dropna()
-                if close.empty: continue
-                data[t]={
-                    "price":float(close.iloc[-1]),
-                    "ma200":float(close.tail(200).mean()),
-                    "high_52w":float(close.tail(252).max()),
-                    "series":close
-                }
-            except Exception: pass
-    except Exception: pass
-    for t in tickers:
-        if t not in data:
-            p=static.get(t,0)
-            data[t]={"price":p,"ma200":p,"high_52w":p,"series":pd.Series(dtype=float)}
-    return data
-
-def v16_alerts(holdings, prices, previous_highs=None):
-    previous_highs = previous_highs or {}
-    rows=[]
-    for _,r in holdings.iterrows():
-        t=str(r.ticker).upper()
-        md=prices.get(t,{})
-        price=v16_num(md.get("price"))
-        avg=v16_num(r.avg_price)
-        shares=v16_num(r.shares)
-
-        # Best available high. V16.1 prefers a stored high, then the
-        # available market history high. This is exposed explicitly.
-        history_high=v16_num(md.get("high_52w"))
-        stored_high=v16_num(previous_highs.get(t))
-        high=max(price, stored_high, history_high)
-
-        ret=(price/avg-1)*100 if avg else 0.0
-        ma200=v16_num(md.get("ma200"))
-        ma_gap=(price/ma200-1)*100 if ma200 else 0.0
-        from_high=(price/high-1)*100 if high else 0.0
-
-        if ret <= V16_STOP_LOSS_PCT:
-            status="STOP LOSS"
-            action="손절 검토"
-        elif from_high <= V16_TRAILING_STOP_PCT:
-            status="TRAILING STOP"
-            action=f"{shares*V16_PARTIAL_SELL_PCT/100:.2f}주 (30%) 부분매도 검토"
-        elif ma200 and price < ma200:
-            status="200MA BELOW"
-            action="200일선 아래 — 추세 주의"
-        else:
-            status="NORMAL"
-            action="정상"
-
-        rows.append({
-            "ticker":t, "shares":shares, "price":price, "avg_price":avg,
-            "return_pct":ret, "ma200":ma200, "ma_gap_pct":ma_gap,
-            "high":high, "from_high_pct":from_high,
-            "partial_shares":shares*V16_PARTIAL_SELL_PCT/100,
-            "status":status, "action":action
-        })
-    return pd.DataFrame(rows)
-
-def v16_sell_review(realized, current_prices):
-    """Summarize realized SELL matches and calculate post-sale return."""
-    if realized is None or realized.empty:
-        return pd.DataFrame()
-    x = realized.copy()
-    x["shares"] = pd.to_numeric(x["shares"], errors="coerce").fillna(0)
-    x["sell_price_usd"] = pd.to_numeric(x["sell_price_usd"], errors="coerce").fillna(0)
-    x["total_pnl_krw"] = pd.to_numeric(x["total_pnl_krw"], errors="coerce").fillna(0)
-    rows=[]
-    for (d,t), g in x.groupby(["date","ticker"], sort=True):
-        qty=g["shares"].sum()
-        sell_price=(g["shares"]*g["sell_price_usd"]).sum()/qty if qty else 0
-        pnl=g["total_pnl_krw"].sum()
-        current=v16_num(current_prices.get(str(t).upper(),{}).get("price"))
-        post=(current/sell_price-1)*100 if sell_price and current else np.nan
-        rows.append({
-            "매도일":str(d), "종목":str(t).upper(), "수량":qty,
-            "매도가":sell_price, "실현손익_원":pnl,
-            "승패":"승" if pnl > 0 else ("패" if pnl < 0 else "보합"),
-            "매도후수익률":post, "현재가":current
-        })
-    return pd.DataFrame(rows)
-
-def v16_daily_direction(prices, tickers, days=10):
-    rows=[]
-    for t in tickers:
-        md=prices.get(str(t).upper(),{})
-        s=md.get("series")
-        if s is None or len(s)<2: continue
-        s=pd.Series(s).dropna().tail(days+1)
-        if len(s)<2: continue
-        prev=None
-        for dt, close in s.iloc[1:].items():
-            prior=float(s.loc[prev]) if prev is not None else None
-            chg=(float(close)/prior-1)*100 if prior else np.nan
-            direction="🟢 상승" if chg>0 else ("🔴 하락" if chg<0 else "⚪ 보합")
-            rows.append({"종목":str(t).upper(),"날짜":pd.to_datetime(dt).strftime("%Y-%m-%d"),"종가":float(close),"일일변동":chg,"방향":direction})
-            prev=dt
-    return pd.DataFrame(rows)
-
-def v16_direction_summary(prices, tickers, window=5):
-    rows=[]
-    for t in tickers:
-        s=prices.get(str(t).upper(),{}).get("series")
-        if s is None or len(s)<window+1: continue
-        s=pd.Series(s).dropna().tail(window+1)
-        rets=s.pct_change().dropna()*100
-        up=int((rets>0).sum()); down=int((rets<0).sum())
-        cum=(float(s.iloc[-1])/float(s.iloc[0])-1)*100
-        if up>=4 and cum>0: trend="🟢 상승"
-        elif down>=4 and cum<0: trend="🔴 하락"
-        else: trend="🟡 횡보/혼조"
-        rows.append({"종목":str(t).upper(),"최근5일":cum,"상승일":up,"하락일":down,"단기추세":trend})
-    return pd.DataFrame(rows)
-
-def v16_upsert_daily_direction(daily_df):
-    if daily_df is None or daily_df.empty: return False
-    try:
-        sb=v15_get_supabase()
-        if sb is None: return False
-        records=[]
-        for _,r in daily_df.iterrows():
-            records.append({"date":str(r["날짜"]),"ticker":str(r["종목"]),"close_price":float(r["종가"]),"daily_return_pct":float(r["일일변동"])})
-        sb.table("daily_directions").upsert(records, on_conflict="date,ticker").execute()
-        return True
-    except Exception:
-        return False
-
-def v16_upsert_snapshot(value, pnl, count):
-    try:
-        sb=v15_get_supabase()
-        if sb is None or value<=0: return False
-        d=datetime.now().date().isoformat()
-        sb.table("portfolio_values").upsert({
-            "date":d,"value_usd":float(value),
-            "holdings_count":int(count),"total_pnl_usd":float(pnl)
-        }, on_conflict="date").execute()
-        return True
-    except Exception:
-        return False
-
-def v16_load_history():
-    try:
-        sb=v15_get_supabase()
-        if sb is None: return pd.DataFrame()
-        res=sb.table("portfolio_values").select("*").order("date").execute()
-        return pd.DataFrame(res.data or [])
-    except Exception:
-        return pd.DataFrame()
-
-
-st.set_page_config(page_title="My Portfolio", page_icon="∞", layout="wide", initial_sidebar_state="expanded")
-
-# ---------- CSS ----------
-st.markdown("""
-<style>
-.stApp { background:#0b0d0f; color:#f4f6f8; }
-.block-container { padding:1rem 2rem 3rem; max-width:1500px; }
-[data-testid="stSidebar"] { background:#080a0c; border-right:1px solid #1b2025; }
-[data-testid="stSidebar"] * { color:#dfe5eb !important; }
-h1,h2,h3,h4 { color:#f4f6f8 !important; }
-p, label { color:#8f98a3 !important; }
-.card { background:#121518; border:1px solid #242a30; border-radius:16px; padding:20px; height:100%; }
-.big { font-size:2.15rem; font-weight:750; letter-spacing:-.04em; color:#fff; }
-.metric-label { color:#8f98a3; font-size:.8rem; margin-bottom:5px; }
-.metric-value { color:#fff; font-size:1.65rem; font-weight:700; }
-.small { font-size:.78rem; color:#8f98a3; }
-.positive { color:#23d98b; font-weight:650; }
-.negative { color:#ff5b63; font-weight:650; }
-.badge { display:inline-block; padding:4px 8px; border-radius:7px; background:#18251f; color:#25db8c; font-size:.75rem; }
-.ticker { background:#111519; border:1px solid #252b31; border-radius:999px; padding:8px 13px; text-align:center; font-size:.78rem; }
-.ticker b { color:#f5f7f9; margin-right:6px; }
-.section-title { font-size:1.15rem; font-weight:700; color:#fff; margin-bottom:12px; }
-.asset-row { display:grid; grid-template-columns:1.25fr .65fr .75fr .85fr .8fr; gap:10px; padding:12px 0; border-bottom:1px solid #20262b; align-items:center; }
-.asset-head { color:#78828d; font-size:.72rem; }
-.asset-name { color:#fff; font-weight:650; }
-.asset-sub { color:#737e89; font-size:.7rem; }
-.info { background:#10181d; border:1px solid #1e3038; border-radius:12px; padding:14px; color:#aab5bf; }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------- Data ----------
-df = pd.read_csv("portfolio.csv")
-prices = {"NVDA":180,"AVGO":380,"MSFT":520,"GOOG":205,"MU":165,"ANET":145,"VRT":205,"COHR":180,"KLAC":1450,"LRCX":145}
-daily = {"NVDA":2.5,"AVGO":1.8,"MSFT":1.3,"GOOG":0.8,"MU":3.1,"ANET":2.0,"VRT":1.5,"COHR":4.2,"KLAC":1.1,"LRCX":1.9}
-df["current_price"] = df.ticker.map(prices).fillna(df.avg_price)
-df["daily_pct"] = df.ticker.map(daily).fillna(0)
-df["market_value"] = df.shares * df.current_price
-df["cost_basis"] = df.shares * df.avg_price
-df["pnl"] = df.market_value - df.cost_basis
-df["return_pct"] = np.where(df.cost_basis != 0, df.pnl / df.cost_basis * 100, 0)
-total_value = df.market_value.sum()
-total_cost = df.cost_basis.sum()
-total_pnl = df.pnl.sum()
-total_return = total_pnl / total_cost * 100 if total_cost else 0
-df["weight"] = df.market_value / total_value * 100
-df["contribution"] = df.pnl / total_cost * 100
-
-
-# ---------- V16 live portfolio calculation ----------
-try:
-    v16_tx_live = v15_load_transactions()
-except Exception:
-    v16_tx_live = pd.DataFrame()
-
-try:
-    v16_fallback = pd.read_csv("portfolio.csv")
-except Exception:
-    v16_fallback = pd.DataFrame(columns=["ticker","shares","avg_price"])
-
-v16_hold = v16_build_holdings(v16_tx_live, v16_fallback)
-v16_prices = v16_market_data(v16_hold["ticker"].tolist() if not v16_hold.empty else [], v16_fallback)
-
-if not v16_hold.empty:
-    v16_hold["current_price"] = v16_hold["ticker"].map(lambda t:v16_num(v16_prices.get(t,{}).get("price")))
-    v16_hold["market_value"] = v16_hold["shares"] * v16_hold["current_price"]
-    v16_hold["cost_basis"] = v16_hold["shares"] * v16_hold["avg_price"]
-    v16_hold["pnl"] = v16_hold["market_value"] - v16_hold["cost_basis"]
-    v16_hold["return_pct"] = (v16_hold["market_value"]/v16_hold["cost_basis"]-1)*100
-    v16_total_value=float(v16_hold["market_value"].sum())
-    v16_total_pnl=float(v16_hold["pnl"].sum())
-    v16_hold["weight"]=v16_hold["market_value"]/v16_total_value*100 if v16_total_value else 0
-else:
-    v16_total_value=0.0
-    v16_total_pnl=0.0
-
-v16_alert_df=v16_alerts(v16_hold, v16_prices)
-# Merge risk/alert analytics back into Holdings so the table shows the
-# same numbers used by Alert Center.
-if not v16_hold.empty and not v16_alert_df.empty:
-    _v16_alert_cols = [
-        "ticker","ma200","ma_gap_pct","high","from_high_pct",
-        "status","action","partial_shares"
-    ]
-    v16_hold = v16_hold.merge(
-        v16_alert_df[_v16_alert_cols],
-        on="ticker", how="left", suffixes=("","_alert")
-    )
-
-v16_stop_df=v16_alert_df[v16_alert_df["status"]=="STOP LOSS"].copy()
-v16_trail_df=v16_alert_df[v16_alert_df["status"]=="TRAILING STOP"].copy()
-
-# Save a daily portfolio snapshot. It is harmless if the table does not exist yet.
-v16_upsert_snapshot(v16_total_value, v16_total_pnl, len(v16_hold))
-v16_history=v16_load_history()
-v16_daily_df = v16_daily_direction(v16_prices, v16_hold["ticker"].tolist() if not v16_hold.empty else [], days=10)
-v16_direction_summary_df = v16_direction_summary(v16_prices, v16_hold["ticker"].tolist() if not v16_hold.empty else [], window=5)
-v16_upsert_daily_direction(v16_daily_df)
-
-
-# ---------- Sidebar navigation ----------
-with st.sidebar:
-    st.markdown("## ∞")
-    st.markdown("### Portfolio")
-    page = st.radio(
-        "Navigation",
-        ["▦  Overview", "▣  Holdings", "▥  Performance", "◫  Allocation", "◴  History", "⚙  Settings"],
-        label_visibility="collapsed"
-    )
-    st.markdown("---")
-    st.markdown('<div class="small">V3 · Navigation enabled</div>', unsafe_allow_html=True)
-
-def header():
-    st.markdown("### 🏠  /  " + page.replace("▦  ","").replace("▣  ","").replace("▥  ","").replace("◫  ","").replace("◴  ","").replace("⚙  ",""))
-    tickers = ""
-    for _, r in df.sort_values("weight", ascending=False).head(7).iterrows():
-        cls = "positive" if r.daily_pct >= 0 else "negative"
-        tickers += f'<div class="ticker"><b>{r.ticker}</b> ${r.current_price:,.2f} <span class="{cls}">{r.daily_pct:+.1f}%</span></div>'
-    st.markdown(f'<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin:10px 0 18px">{tickers}</div>', unsafe_allow_html=True)
-
-header()
-
-# ---------- Overview ----------
-
-
-# ---------- V16 Alert Center ----------
-
-if "page" in locals() and str(page).startswith(("▦","Overview","overview")):
-    if not v16_stop_df.empty or not v16_trail_df.empty:
-        st.markdown("## 🚨 ALERT CENTER")
-        if not v16_stop_df.empty:
-            st.error("🔴 STOP LOSS — 수익률 -32% 이하. 손절을 검토하세요.")
-            for _,a in v16_stop_df.iterrows():
-                st.markdown(
-                    f"**{a.ticker}** · 현재 수익률 **{a.return_pct:+.1f}%** · "
-                    f"손절 기준 {V16_STOP_LOSS_PCT:.0f}% · **손절 검토**"
-                )
-        if not v16_trail_df.empty:
-            st.warning("🟠 TRAILING STOP — 전고점 대비 -10% 이하. 30% 부분매도를 검토하세요.")
-            for _,a in v16_trail_df.iterrows():
-                st.markdown(
-                    f"**{a.ticker}** · 전고점 ${a.high:,.2f} → 현재 ${a.price:,.2f} "
-                    f"({a.from_high_pct:+.1f}%) · **{a.partial_shares:.2f}주 (30%) 부분매도 검토**"
-                )
+    if gap <= cfg["stage4_gap"]:
+        stage, title, target = 4, "4단계 · 시발", cfg["weights"][4]
+    elif gap <= cfg["stage3_gap"] or cb >= 3:
+        stage, title, target = 3, "3단계 · 진성 하락", cfg["weights"][3]
+    elif gap < 0:
+        stage, title, target = 2, "2단계 · 초기 하락", cfg["weights"][2]
+    elif recross:
+        stage, title, target = "recovery", "상승 복귀 · 2주차", cfg["weights"]["recovery"]
+    elif ca >= 2:
+        stage, title, target = 1, "1단계 · 강세장", cfg["weights"][1]
     else:
-        st.success("🟢 No Critical Alerts — 현재 손절/트레일링 스톱 조건에 해당하는 종목이 없습니다.")
+        stage, title, target = 2, "2단계 · 초기 하락/확인", cfg["weights"][2]
 
-if page.startswith("▦"):
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Portfolio value", f"${total_value:,.0f}")
-    c2.metric("Invested", f"${total_cost:,.0f}")
-    c3.metric("Total P&L", f"${total_pnl:,.0f}", f"{total_return:+.2f}%")
-    c4.metric("Holdings", f"{len(df)}")
+    lr = l.dropna(subset=["ma200"]).iloc[-1]
+    lev_gap = float(lr["gap"])
+    emergency = next(({"threshold": th, "weight": wt} for th, wt in cfg["emergency"] if gap <= th), None)
+    return {
+        "cfg": cfg, "snapshots": snaps, "date": snaps.index[-1],
+        "price": float(snaps.iloc[-1]["close"]), "ma": float(snaps.iloc[-1]["ma200"]),
+        "gap": gap, "stage": stage, "title": title, "target": target,
+        "above_count": ca, "below_count": cb, "recross": recross,
+        "lev_gap": lev_gap, "emergency": emergency,
+    }
 
-    st.markdown("---")
-    left,right = st.columns([1.15,1])
-    with left:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Value trend & impact</div>', unsafe_allow_html=True)
-        x=np.arange(12); y=total_value*(.91+.01*x+.018*np.sin(x*1.1))
-        st.line_chart(pd.DataFrame({"Portfolio":y}, index=[f"{i+1}M" for i in x]), height=230)
-        st.markdown('<div class="small">V3 demo history. Real daily history will be connected later.</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-    with right:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Risk snapshot</div>', unsafe_allow_html=True)
-        st.metric("Top 5 concentration", f"{df.nlargest(5,'market_value').weight.sum():.1f}%")
-        ai = df[df.category.isin(["AI","Memory","Optical","Networking","Power","Semiconductor Equipment"])].market_value.sum()/total_value*100
-        st.metric("AI / infrastructure exposure", f"{ai:.1f}%")
-        st.metric("Largest position", f"{df.loc[df.market_value.idxmax(),'ticker']} · {df.weight.max():.1f}%")
-        st.markdown('</div>', unsafe_allow_html=True)
+# ---------- Trade journal / holdings ----------
+def load_trades():
+    return pd.DataFrame(db_select("strategy_trades"))
 
-    st.markdown("---")
-    a,b = st.columns([1,1])
-    with a:
-        st.markdown('<div class="card"><div class="section-title">Theme allocation</div>', unsafe_allow_html=True)
-        theme = df.groupby("category").market_value.sum()/total_value*100
-        st.bar_chart(theme, height=240)
-        st.markdown('</div>', unsafe_allow_html=True)
-    with b:
-        st.markdown('<div class="card"><div class="section-title">Asset performance</div>', unsafe_allow_html=True)
-        for _,r in df.sort_values("weight",ascending=False).iterrows():
-            cls="positive" if r.return_pct>=0 else "negative"
-            st.markdown(f'<div class="asset-row"><div><div class="asset-name">{r.ticker}</div><div class="asset-sub">{r.category}</div></div><div>{r.weight:.1f}%</div><div class="{cls}">{r.return_pct:+.1f}%</div><div class="{cls}">{r.contribution:+.2f}%</div><div>${r.market_value:,.0f}</div></div>',unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+def normalize_trades(df):
+    if df.empty: return df
+    for c in ["shares", "price", "fx_rate", "fee"]:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df.sort_values(["date", "id"])
+
+def calculate_holdings(trades, prices):
+    if trades.empty:
+        return pd.DataFrame(columns=["ticker","shares","avg_price","cost","current_price","market_value","pnl","return_pct"])
+    rows = []
+    for ticker, g in trades.groupby(trades["ticker"].str.upper()):
+        qty = 0.0
+        cost = 0.0
+        for _, r in g.sort_values(["date","id"]).iterrows():
+            sh = float(r["shares"])
+            px = float(r["price"])
+            typ = str(r["type"]).upper()
+            if typ == "BUY":
+                cost += sh * px
+                qty += sh
+            elif typ == "SELL" and qty > 0:
+                avg = cost / qty
+                qty -= sh
+                cost = max(0, qty * avg)
+        if qty <= 1e-9: continue
+        current = float(prices.get(ticker, np.nan))
+        mv = qty * current if np.isfinite(current) else np.nan
+        pnl = mv - cost if np.isfinite(mv) else np.nan
+        ret = pnl / cost * 100 if cost else np.nan
+        rows.append({
+            "ticker": ticker, "shares": qty, "avg_price": cost/qty if qty else 0,
+            "cost": cost, "current_price": current, "market_value": mv,
+            "pnl": pnl, "return_pct": ret
+        })
+    return pd.DataFrame(rows)
+
+def fmt_money(x):
+    return "-" if pd.isna(x) else f"${x:,.2f}"
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("V1.1")
+    page = st.radio("메뉴", ["전략 대시보드", "📒 매매일지", "💼 현재 홀딩스"])
+    st.caption("전략: 2주 판정 · 월중 비상 대응")
+    if st.button("🔄 전체 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
+
+prices_data = load_prices(["QQQ","TQQQ","SOXX","SOXL"])
+prices = {t: float(df["close"].iloc[-1]) for t, df in prices_data.items() if not df.empty}
+
+# ---------- Strategy dashboard ----------
+if page == "전략 대시보드":
+    st.title("📈 Leveraged Strategy Dashboard V1.2")
+    st.caption("매일 계산 · 2주마다 판정 · 급락 시 즉시 비상 대응")
+
+    states = {n: strategy_state(n, prices_data) for n in STRATEGIES}
+    for n, s in states.items():
+        if "error" in s: st.error(s["error"])
+
+    if all("error" not in s for s in states.values()):
+        st.info(f"현재 데이터 기준일: **{max(s['date'] for s in states.values()):%Y-%m-%d}**")
+        cols = st.columns(2)
+        for col, (name, s) in zip(cols, states.items()):
+            with col:
+                icon = {1:"🟢",2:"🟡",3:"🟠",4:"🔴","recovery":"🔵"}[s["stage"]]
+                st.subheader(name)
+                st.markdown(f"### {icon} {s['title']}")
+                a,b,c = st.columns(3)
+                a.metric(s["cfg"]["underlying"], f"${s['price']:,.2f}")
+                b.metric("200MA", f"${s['ma']:,.2f}")
+                c.metric("200MA 이격", f"{s['gap']:+.1f}%")
+                st.success(f"목표: **{s['cfg']['leveraged']} {s['target']}% / 현금 {100-s['target']}%**")
+                if s["emergency"]:
+                    e=s["emergency"]
+                    st.error(f"🚨 월중 비상: {s['cfg']['underlying']} {s['gap']:+.1f}% → {s['cfg']['leveraged']} **{e['weight']}%** 검토")
+                if s["stage"] == 2:
+                    st.write(f"200MA 아래 확인: {s['below_count']}회")
+                elif s["stage"] == 3:
+                    st.write(f"200MA 아래 확인: {s['below_count']}회")
+                elif s["stage"] == 1:
+                    st.write(f"200MA 위 확인: {s['above_count']}회")
+                elif s["stage"] == "recovery":
+                    st.write("재돌파 후 2주차 → 비중 회복")
+                if s["lev_gap"] >= s["cfg"]["bubble"]:
+                    st.warning(f"🔥 버블 보험: {s['cfg']['leveraged']} 200MA 이격 {s['lev_gap']:+.1f}%")
+
+# ---------- Trade journal ----------
+elif page == "📒 매매일지":
+    st.title("📒 매매일지")
+    st.caption("BUY / SELL을 기록하면 현재 홀딩스가 자동으로 계산됩니다.")
+
+    with st.form("trade_form", clear_on_submit=True):
+        c1,c2,c3,c4 = st.columns(4)
+        date = c1.date_input("거래일", datetime.now().date())
+        ticker = c2.text_input("종목", placeholder="TQQQ 또는 SOXL").upper().strip()
+        typ = c3.selectbox("구분", ["BUY","SELL"])
+        shares = c4.number_input("수량", min_value=0.0001, step=1.0, format="%.4f")
+        c5,c6,c7 = st.columns(3)
+        price = c5.number_input("주당 가격($)", min_value=0.0, step=0.01, format="%.4f")
+        fx = c6.number_input("환율(원/$)", min_value=0.0, value=1400.0, step=1.0)
+        fee = c7.number_input("수수료($)", min_value=0.0, step=0.01)
+        memo = st.text_input("메모")
+        submitted = st.form_submit_button("거래 기록 저장", type="primary")
+
+    if submitted:
+        if not ticker or shares <= 0 or price <= 0:
+            st.error("종목, 수량, 가격을 입력해 주세요.")
+        else:
+            ok, msg = db_insert("strategy_trades", {
+                "date": str(date), "ticker": ticker, "type": typ,
+                "shares": float(shares), "price": float(price),
+                "fx_rate": float(fx), "fee": float(fee), "memo": memo
+            })
+            if ok:
+                st.success("거래가 저장되었습니다.")
+                st.rerun()
+            else:
+                st.error(f"저장 실패: {msg}")
+
+    trades = normalize_trades(load_trades())
+    if not trades.empty:
+        display = trades.copy()
+        display["거래일"] = display["date"].dt.strftime("%Y-%m-%d")
+        display["금액($)"] = display["shares"] * display["price"]
+        display["금액($)"] = display["금액($)"].map(lambda x:f"${x:,.2f}")
+        display["환율"] = display["fx_rate"].map(lambda x:f"{x:,.0f}")
+        display = display.rename(columns={"ticker":"종목","type":"구분","shares":"수량","price":"가격($)","memo":"메모"})
+        st.dataframe(display[["거래일","종목","구분","수량","가격($)","금액($)","환율","메모"]].iloc[::-1], use_container_width=True, hide_index=True)
+
+        st.markdown("#### 거래 삭제")
+        options = [f"{r.id} · {r.ticker} · {r.type} · {r.date:%Y-%m-%d} · {r.shares:g}주" for r in trades.itertuples()]
+        selected = st.selectbox("삭제할 거래", options)
+        if st.button("선택 거래 삭제"):
+            row_id = int(selected.split(" · ")[0])
+            ok,msg=db_delete("strategy_trades",row_id)
+            if ok: st.success("삭제했습니다."); st.rerun()
+            else: st.error(msg)
+    else:
+        st.info("아직 기록된 거래가 없습니다.")
 
 # ---------- Holdings ----------
-elif page.startswith("▣"):
-    st.markdown(
-        '<div class="info">거래일지의 BUY/SELL 기록을 기준으로 보유수량과 평균매수가를 계산하고, '
-        '현재가·200일선·전고점 기준의 리스크 상태를 함께 표시합니다.</div>',
-        unsafe_allow_html=True
-    )
-    if v16_hold.empty:
-        st.info("보유 종목이 없습니다. 거래일지에 BUY를 입력해 주세요.")
-    else:
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("보유 종목", f"{len(v16_hold)}개")
-        total_mv = float(v16_hold["market_value"].sum())
-        top5 = float(v16_hold.nlargest(5,"market_value")["market_value"].sum()) / total_mv * 100 if total_mv else 0
-        c2.metric("상위 5 비중", f"{top5:.1f}%")
-        c3.metric("총 평가손익", f"${v16_hold['pnl'].sum():,.0f}")
-        c4.metric("Risk Signals", f"{int((v16_alert_df['status'] != 'NORMAL').sum())}개")
-
-        st.markdown("#### Risk & Action Monitor")
-        view = v16_hold.sort_values("weight", ascending=False).copy()
-        view["종목"] = view["ticker"]
-        view["테마"] = view["category"]
-        view["수량"] = view["shares"].map(lambda x:f"{x:.4g}")
-        view["매입단가"] = view["avg_price"].map(lambda x:f"${x:,.2f}")
-        view["현재가"] = view["current_price"].map(lambda x:f"${x:,.2f}")
-        view["평가액"] = view["market_value"].map(lambda x:f"${x:,.0f}")
-        view["비중"] = view["weight"].map(lambda x:f"{x:.1f}%")
-        view["수익률"] = view["return_pct"].map(lambda x:f"{x:+.1f}%")
-        view["200일선 이격"] = view["ma_gap_pct"].map(lambda x:f"{x:+.1f}%")
-        view["전고점"] = view["high"].map(lambda x:f"${x:,.2f}")
-        view["전고점 대비"] = view["from_high_pct"].map(lambda x:f"{x:+.1f}%")
-        view["상태"] = view["status"].map({
-            "STOP LOSS":"🔴 STOP LOSS",
-            "TRAILING STOP":"🟠 TRAILING STOP",
-            "200MA BELOW":"🟡 200MA BELOW",
-            "NORMAL":"🟢 NORMAL"
-        }).fillna("⚪ UNKNOWN")
-        view["액션"] = view["action"].fillna("정상")
-        if not v16_direction_summary_df.empty:
-            _dir = v16_direction_summary_df.set_index("종목")
-            view["최근5일"] = view["ticker"].map(_dir["최근5일"]).map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "-")
-            view["단기추세"] = view["ticker"].map(_dir["단기추세"]).fillna("⚪ 데이터 부족")
-        else:
-            view["최근5일"] = "-"
-            view["단기추세"] = "⚪ 데이터 부족"
-
-        st.dataframe(
-            view[["종목","테마","수량","매입단가","현재가","평가액","비중",
-                  "수익률","200일선 이격","전고점","전고점 대비","최근5일","단기추세","상태","액션"]],
-            use_container_width=True, hide_index=True
-        )
-        st.caption("200일선 이격 = 현재가와 200일 이동평균선의 거리 · 전고점 대비 = 현재가와 가용 최고가의 차이 · 최근5일/단기추세는 일봉 종가 기준")
-
-        st.markdown("#### 📈 Daily Direction — 최근 10거래일")
-        if not v16_daily_df.empty:
-            dd = v16_daily_df.copy()
-            dd["종가"] = dd["종가"].map(lambda x:f"${x:,.2f}")
-            dd["일일변동"] = dd["일일변동"].map(lambda x:f"{x:+.2f}%")
-            st.dataframe(dd[["종목","날짜","종가","일일변동","방향"]], use_container_width=True, hide_index=True)
-        else:
-            st.info("일봉 데이터를 불러오지 못했습니다. yfinance 연결을 확인하세요.")
-
-        active = view[view["status"] != "NORMAL"]
-        if not active.empty:
-            st.markdown("#### ⚠️ Active Signals")
-            for _, row in active.iterrows():
-                if row["status"] == "STOP LOSS":
-                    st.error(f"{row['종목']} · {row['수익률']} · **STOP LOSS → 손절 검토**")
-                elif row["status"] == "TRAILING STOP":
-                    qty = v16_num(row["shares"]) * V16_PARTIAL_SELL_PCT / 100
-                    st.warning(f"{row['종목']} · 전고점 대비 {row['전고점 대비']} · **{qty:.2f}주 (30%) 부분매도 검토**")
-                elif row["status"] == "200MA BELOW":
-                    st.warning(f"{row['종목']} · 200일선 이격 {row['200일선 이격']} · **200일선 아래 — 추세 주의**")
-
-# ---------- Placeholder pages ----------
-elif page.startswith("▥"):
-    st.info("Performance 페이지 — 다음 버전에서 기간별 수익률, QQQ/SPY 비교, 종목별 수익 기여도를 구현합니다.")
-elif page.startswith("◫"):
-    st.info("Allocation 페이지 — AI/메모리/광통신/네트워크/전력/장비 등 실제 테마 노출도를 종목별로 분해해 보여줄 예정입니다.")
-elif page.startswith("◴"):
-    st.info("History 페이지 — 거래내역과 포트폴리오 가치 변화를 저장하고 과거 시점의 포트폴리오를 볼 수 있게 만들 예정입니다.")
 else:
-    st.info("Settings 페이지 — 목표비중, 테마 분류, 시장 전략 설정 등을 관리하게 만들 예정입니다.")
+    st.title("💼 현재 홀딩스")
+    st.caption("매매일지의 BUY / SELL을 바탕으로 현재 보유수량과 손익을 자동 계산합니다.")
 
+    trades = normalize_trades(load_trades())
+    holdings = calculate_holdings(trades, prices)
 
-
-# ===== V14: FX-aware Transaction Journal =====
-st.markdown("### 💱 Transaction Journal — V14")
-st.caption("매수·매도 당시 환율을 저장하여 주가손익과 환차익/환차손을 분리합니다.")
-
-v14_tx_path = Path("transactions.csv")
-v14_tx = v15_load_transactions()
-v14_tx = v14_normalize_transactions(v14_tx)
-v14_cols = [
-    "date", "ticker", "type", "shares",
-    "price", "fx_rate", "fee_usd", "note"
-]
-
-v14_editor_df = v14_tx[v14_cols].copy() if not v14_tx.empty else v15_empty_transactions()
-v14_edited = st.data_editor(
-    v14_editor_df,
-    num_rows="dynamic",
-    use_container_width=True,
-    key="v14_transaction_editor",
-    column_config={
-        "date": st.column_config.TextColumn("날짜"),
-        "ticker": st.column_config.TextColumn("종목"),
-        "type": st.column_config.SelectboxColumn(
-            "구분", options=["BUY", "SELL"]
-        ),
-        "shares": st.column_config.NumberColumn(
-            "수량", min_value=0.0, step=1.0
-        ),
-        "price": st.column_config.NumberColumn(
-            "주가(USD)", min_value=0.0, step=0.01, format="$%.2f"
-        ),
-        "fx_rate": st.column_config.NumberColumn(
-            "거래환율(원/$)", min_value=0.0, step=1.0, format="%.0f"
-        ),
-        "fee_usd": st.column_config.NumberColumn(
-            "수수료(USD)", min_value=0.0, step=0.01
-        ),
-        "note": st.column_config.TextColumn("메모")
-    }
-)
-
-if st.button("💾 거래내역 저장", key="v15_save_transactions"):
-    ok, msg = v15_save_transactions(v14_edited)
-    if ok:
-        st.success(msg)
-        st.rerun()
+    if holdings.empty:
+        st.info("매매일지에 BUY 거래를 입력하면 현재 홀딩스가 자동으로 나타납니다.")
     else:
-        st.error(msg)
+        total = holdings["market_value"].sum()
+        total_cost = holdings["cost"].sum()
+        total_pnl = holdings["pnl"].sum()
+        a,b,c = st.columns(3)
+        a.metric("총 평가액", f"${total:,.0f}")
+        b.metric("총 매입원가", f"${total_cost:,.0f}")
+        c.metric("미실현 손익", f"${total_pnl:+,.0f}")
 
-v14_realized = v14_realized_fx_pnl(v14_edited)
+        h=holdings.copy()
+        h["종목"]=h["ticker"]
+        h["수량"]=h["shares"].map(lambda x:f"{x:.4f}")
+        h["평균매수가"]=h["avg_price"].map(lambda x:f"${x:,.2f}")
+        h["현재가"]=h["current_price"].map(lambda x:f"${x:,.2f}" if pd.notna(x) else "-")
+        h["평가액"]=h["market_value"].map(lambda x:f"${x:,.0f}" if pd.notna(x) else "-")
+        h["손익"]=h["pnl"].map(lambda x:f"${x:+,.0f}" if pd.notna(x) else "-")
+        h["수익률"]=h["return_pct"].map(lambda x:f"{x:+.1f}%" if pd.notna(x) else "-")
+        st.dataframe(h[["종목","수량","평균매수가","현재가","평가액","손익","수익률"]], use_container_width=True, hide_index=True)
 
-if not v14_realized.empty:
-    st.markdown("#### 실현손익 — 주가손익 vs 환차손익")
+        st.markdown("#### 🎯 전략 목표비중과 비교")
+        states = {n: strategy_state(n, prices_data) for n in STRATEGIES}
+        target_map = {"TQQQ": None, "SOXL": None}
+        for s in states.values():
+            if "error" not in s: target_map[s["cfg"]["leveraged"]] = s["target"]
+        if total > 0:
+            cmp = holdings.copy()
+            cmp["실제 비중"] = cmp["market_value"] / total * 100
+            cmp["목표 비중"] = cmp["ticker"].map(target_map)
+            cmp["차이"] = cmp["목표 비중"] - cmp["실제 비중"]
+            cmp["행동"] = cmp["차이"].map(lambda x: "매수 검토" if pd.notna(x) and x > 1 else ("매도 검토" if pd.notna(x) and x < -1 else "유지"))
+            cmp["실제 비중"] = cmp["실제 비중"].map(lambda x:f"{x:.1f}%")
+            cmp["목표 비중"] = cmp["목표 비중"].map(lambda x:f"{x:.0f}%" if pd.notna(x) else "-")
+            cmp["차이"] = cmp["차이"].map(lambda x:f"{x:+.1f}%p" if pd.notna(x) else "-")
+            st.dataframe(cmp[["ticker","실제 비중","목표 비중","차이","행동"]].rename(columns={"ticker":"종목"}), use_container_width=True, hide_index=True)
 
-    v14_stock_total = v14_realized["stock_pnl_krw"].sum()
-    v14_fx_total = v14_realized["fx_pnl_krw"].sum()
-    v14_total = v14_realized["total_pnl_krw"].sum()
+st.divider()
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("주가손익", f"₩{v14_stock_total:,.0f}")
-    c2.metric("환차익 / 환차손", f"₩{v14_fx_total:,.0f}")
-    c3.metric("총 실현손익", f"₩{v14_total:,.0f}")
+st.subheader("📜 Strategy Rules")
+st.caption("현재 적용 중인 전체 전략 규칙을 언제든 확인할 수 있습니다.")
 
-    v14_show = v14_realized[[
-        "date", "ticker", "shares",
-        "buy_price_usd", "sell_price_usd",
-        "buy_fx", "sell_fx",
-        "stock_pnl_krw", "fx_pnl_krw", "total_pnl_krw",
-        "stock_return_pct", "fx_return_pct", "total_return_pct"
-    ]].copy()
+def show_rules(name, s):
+    cfg = s["cfg"]
+    lev, und = cfg["leveraged"], cfg["underlying"]
+    df = pd.DataFrame([
+        {"현재":"","단계":"🟢 1단계 · 강세장","조건":f"{und} 200MA 위 2회 연속",lev:f"{cfg['weights'][1]}%","현금":f"{100-cfg['weights'][1]}%","행동":"적극 보유"},
+        {"현재":"","단계":"🟡 2단계 · 초기 하락","조건":f"{und} 200MA 첫 이탈",lev:f"{cfg['weights'][2]}%","현금":f"{100-cfg['weights'][2]}%","행동":"비중 축소"},
+        {"현재":"","단계":"🟠 3단계 · 진성 하락","조건":f"200MA 아래 3회 연속 OR 이격도 {cfg['stage3_gap']:.0f}% 이하",lev:f"{cfg['weights'][3]}%","현금":f"{100-cfg['weights'][3]}%","행동":"방어"},
+        {"현재":"","단계":"🔴 4단계 · 시발","조건":f"{und} 200MA 대비 {cfg['stage4_gap']:.0f}% 이하",lev:f"{cfg['weights'][4]}%","현금":f"{100-cfg['weights'][4]}%","행동":"강력 방어"},
+        {"현재":"","단계":"🔵 상승 복귀 · 2주차","조건":f"{und} 200MA 재돌파 후 2주차",lev:f"{cfg['weights']['recovery']}%","현금":f"{100-cfg['weights']['recovery']}%","행동":"단계적 재진입"},
+    ])
+    idx = {1:0,2:1,3:2,4:3,"recovery":4}.get(s["stage"])
+    if idx is not None: df.loc[idx,"현재"]="◀ 현재 적용"
+    def hl(row):
+        return ["font-weight:700" if row["현재"]=="◀ 현재 적용" else "" for _ in row]
+    st.markdown(f"### {name}")
+    st.dataframe(df.style.apply(hl,axis=1), use_container_width=True, hide_index=True)
+    st.markdown(f"**🚨 月중 비상 대응:** {und} ≤ {cfg['emergency'][0][0]:.0f}% → {lev} **{cfg['emergency'][0][1]}%** · {und} ≤ {cfg['emergency'][1][0]:.0f}% → {lev} **{cfg['emergency'][1][1]}%**")
+    st.markdown(f"**🔥 버블 보험:** {lev}가 자기 200MA 대비 **+{cfg['bubble']:.0f}% 이상**이면 주식 비중 **60%까지 축소 검토**")
 
-    v14_show.columns = [
-        "매도일", "종목", "수량",
-        "매수가($)", "매도가($)",
-        "매수환율", "매도환율",
-        "주가손익(원)", "환차손익(원)", "총손익(원)",
-        "주가수익률(%)", "환율수익률(%)", "총수익률(%)"
-    ]
+show_rules("TQQQ / QQQ", states["TQQQ / QQQ"])
+show_rules("SOXL / SOXX", states["SOXL / SOXX"])
 
-    st.dataframe(
-        v14_show,
-        use_container_width=True,
-        hide_index=True
-    )
+st.info("📌 **운용 원칙:** 매일 계산 → **2주마다 판정** → 급락 시 **즉시 비상 대응**. 정상적인 시장에서는 2주마다 한 번만 비중을 조절하고, 비상 기준에 도달하면 다음 판정일까지 기다리지 않습니다.")
 
-    # V16.2 — Sell Review
-    st.markdown("#### 🏆 매도 성과 — 승/패 & 매도 후 수익률")
-    v16_sell = v16_sell_review(v14_realized, v16_prices)
-    if not v16_sell.empty:
-        wins = int((v16_sell["승패"] == "승").sum())
-        losses = int((v16_sell["승패"] == "패").sum())
-        decided = wins + losses
-        win_rate = wins / decided * 100 if decided else 0
-        avg_post = pd.to_numeric(v16_sell["매도후수익률"], errors="coerce").mean()
-        c1,c2,c3,c4 = st.columns(4)
-        c1.metric("승", f"{wins}회")
-        c2.metric("패", f"{losses}회")
-        c3.metric("승률", f"{win_rate:.1f}%")
-        c4.metric("매도 후 평균", f"{avg_post:+.1f}%" if pd.notna(avg_post) else "-")
-
-        show = v16_sell.copy()
-        show["매도가"] = show["매도가"].map(lambda x:f"${x:,.2f}")
-        show["실현손익"] = show["실현손익_원"].map(lambda x:f"₩{x:,.0f}")
-        show["매도후수익률"] = show["매도후수익률"].map(lambda x:f"{x:+.1f}%" if pd.notna(x) else "-")
-        show["현재가"] = show["현재가"].map(lambda x:f"${x:,.2f}" if x else "-")
-        st.dataframe(show[["매도일","종목","수량","매도가","실현손익","승패","현재가","매도후수익률"]].rename(columns={"매도일":"매도일","매도후수익률":"매도 후 수익률"}), use_container_width=True, hide_index=True)
-        st.caption("승/패는 매도 시점의 실현손익 기준입니다. '매도 후 수익률'은 매도가 대비 현재가의 변화입니다.")
 
