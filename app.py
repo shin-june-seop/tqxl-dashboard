@@ -16,7 +16,7 @@ except ImportError:
     create_client = None
     Client = object
 
-APP_VERSION = "V2.2"
+APP_VERSION = "V2.3"
 
 st.set_page_config(page_title="TQQQ / SOXL Control Center V2", page_icon="📈", layout="wide")
 
@@ -305,19 +305,18 @@ if page == "Dashboard":
     accounts = load_accounts() if supabase else pd.DataFrame(columns=["etf","shares","avg_cost","cash"])
     acct_rows, totals = account_summary(accounts, market_data) if not accounts.empty else (pd.DataFrame(), {"invested":0,"market_value":0,"cash":0,"assets":0,"pnl":0,"return_pct":0})
     st.subheader("💰 내 계좌 현황")
-    m1,m2,m3,m4,m5 = st.columns(5)
+    m1,m2,m3,m4 = st.columns(4)
     m1.metric("총 평가액", money(totals["assets"]))
     m2.metric("투자원금", money(totals["invested"]))
     m3.metric("평가손익", money(totals["pnl"]))
     m4.metric("수익률", f"{totals['return_pct']:+.2f}%")
-    m5.metric("현금", money(totals["cash"]))
     if not acct_rows.empty:
         display = acct_rows.copy()
         display["평단"] = display["평단"].map(money); display["현재가"] = display["현재가"].map(money)
         display["평가액"] = display["평가액"].map(money); display["손익"] = display["손익"].map(money)
         display["투자원금"] = display["투자원금"].map(money); display["현금"] = display["현금"].map(money)
         display["수익률"] = display["수익률"].map(lambda x:f"{x:+.2f}%")
-        st.dataframe(display[["ETF","수량","평단","현재가","평가액","투자원금","손익","수익률","현금"]], use_container_width=True, hide_index=True)
+        st.dataframe(display[["ETF","수량","평단","현재가","평가액","투자원금","손익","수익률"]], use_container_width=True, hide_index=True)
         st.caption("※ Trade Journal에서 매수/매도를 저장하면 수량·평단·현금이 자동으로 Accounts에 반영됩니다.")
 
     c1, c2 = st.columns(2)
@@ -334,13 +333,23 @@ if page == "Dashboard":
 
     st.subheader("📊 목표 비중 vs 실제 비중")
     alloc_rows=[]
-    total_assets = totals["assets"] or 0
+    total_assets = float(totals.get("assets", 0) or 0)
+    if total_assets <= 0:
+        st.info("계좌 총자산이 0 이하라 실제 비중을 계산할 수 없습니다. Accounts에서 보유수량·평단·현금을 확인하세요.")
     for t,res in [("TQQQ",res_t),("SOXL",res_s)]:
         row = acct_rows[acct_rows["ETF"]==t] if not acct_rows.empty else pd.DataFrame()
         value = float(row["평가액"].iloc[0]) if not row.empty else 0.0
-        actual = value / total_assets * 100 if total_assets else 0.0
-        alloc_rows.append({"ETF":t,"목표 비중":f"{res['target']}%","실제 비중":f"{actual:.1f}%","차이":f"{actual-res['target']:+.1f}%p"})
+        actual = (value / total_assets * 100) if total_assets > 0 else None
+        alloc_rows.append({
+            "ETF":t,
+            "목표 비중":f"{res['target']}%",
+            "실제 비중":f"{actual:.1f}%" if actual is not None else "-",
+            "차이":f"{actual-res['target']:+.1f}%p" if actual is not None else "-"
+        })
     st.dataframe(pd.DataFrame(alloc_rows), use_container_width=True, hide_index=True)
+    if totals.get("cash", 0) < 0:
+        st.warning(f"계좌의 현금 합계가 {money(totals['cash'])}로 음수입니다. 현재 실제 비중은 총자산(ETF 평가액 + 현금)을 기준으로 계산하므로, 현금 입력이 빠졌거나 테스트 매매가 남아 있으면 비중이 비정상적으로 커질 수 있습니다.")
+    st.caption("실제 비중 = 해당 ETF 평가액 ÷ (TQQQ 평가액 + SOXL 평가액 + 계좌 현금) × 100")
 
     st.subheader("🚨 비상 조건 모니터")
     e1,e2=st.columns(2)
@@ -405,13 +414,13 @@ elif page == "Trade Journal":
             stage=st.selectbox("당시 단계",["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"], index=["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"].index(stage_default))
             reason=st.text_input("매매 이유", value=auto_res["reason"]); memo=st.text_area("메모")
             submitted=st.form_submit_button("매매 기록 추가", type="primary")
-        ok=False
         if submitted:
             if shares <= 0 or price <= 0:
                 st.error("수량과 가격은 0보다 커야 합니다.")
             else:
                 # Atomic DB function is preferred; fallback keeps compatibility with an existing V2 schema.
                 payload={"p_trade_date":str(date),"p_etf":etf,"p_side":side,"p_shares":float(shares),"p_price":float(price),"p_stage":stage,"p_reason":reason,"p_memo":memo}
+                ok=False
                 try:
                     supabase.rpc("record_trade_and_update_account", payload).execute()
                     ok=True
@@ -439,9 +448,9 @@ elif page == "Trade Journal":
                         st.info("기존 V2 스키마 호환 방식으로 계좌도 갱신했습니다. (권장: V2.2 SQL 함수 설치)")
                     except Exception as fallback_error:
                         st.error(f"매매 저장/계좌 반영 실패: {fallback_error}")
-            if ok:
-                st.success("매매 기록과 계좌 반영이 완료되었습니다.")
-                st.rerun()
+        if ok:
+            st.success("매매 기록과 계좌 반영이 완료되었습니다.")
+            st.rerun()
         trades=db_select("trades",order=("trade_date",True))
         if not trades.empty:
             st.dataframe(trades.rename(columns={"trade_date":"날짜","etf":"ETF","side":"구분","shares":"수량","price":"가격","amount":"금액","stage":"단계","reason":"매매 이유","memo":"메모"}),use_container_width=True,hide_index=True)
