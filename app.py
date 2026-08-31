@@ -16,7 +16,7 @@ except ImportError:
     create_client = None
     Client = object
 
-APP_VERSION = "V2"
+APP_VERSION = "V2.2"
 
 st.set_page_config(page_title="TQQQ / SOXL Control Center V2", page_icon="📈", layout="wide")
 
@@ -243,6 +243,40 @@ def load_accounts():
     return df[[c for c in ["etf","shares","avg_cost","cash"] if c in df.columns]]
 
 
+def account_summary(accounts, market_data):
+    """Return per-ETF and portfolio-level live account metrics."""
+    rows = []
+    total_invested = 0.0
+    total_market_value = 0.0
+    total_cash = 0.0
+    for _, r in accounts.iterrows():
+        t = str(r["etf"])
+        shares = float(r.get("shares", 0) or 0)
+        avg = float(r.get("avg_cost", 0) or 0)
+        cash = float(r.get("cash", 0) or 0)
+        df = market_data.get(t, pd.DataFrame())
+        cur = float(df["Close"].iloc[-1]) if not df.empty else 0.0
+        cost = shares * avg
+        value = shares * cur
+        pnl = value - cost
+        total_invested += cost
+        total_market_value += value
+        total_cash += cash
+        rows.append({
+            "ETF": t, "수량": shares, "평단": avg, "현재가": cur,
+            "평가액": value, "투자원금": cost, "손익": pnl,
+            "수익률": (pnl / cost * 100) if cost else 0.0,
+            "현금": cash,
+        })
+    total_assets = total_market_value + total_cash
+    total_pnl = total_market_value - total_invested
+    return pd.DataFrame(rows), {
+        "invested": total_invested, "market_value": total_market_value,
+        "cash": total_cash, "assets": total_assets, "pnl": total_pnl,
+        "return_pct": (total_pnl / total_invested * 100) if total_invested else 0.0,
+    }
+
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.title("📈 TQQQ / SOXL")
@@ -266,6 +300,26 @@ if page == "Dashboard":
     st.markdown('<div class="hero"><h1>Leveraged ETF Control Center</h1><p>TQQQ / SOXL 규칙 기반 운용 · 2주 점검 + 월중 비상대응 · Supabase 영구 저장</p></div>', unsafe_allow_html=True)
     if not supabase:
         st.warning("Supabase가 연결되지 않았습니다. Settings에서 Secrets를 설정하면 계좌/매매일지/스냅샷이 영구 저장됩니다.")
+
+    # Live account overview
+    accounts = load_accounts() if supabase else pd.DataFrame(columns=["etf","shares","avg_cost","cash"])
+    acct_rows, totals = account_summary(accounts, market_data) if not accounts.empty else (pd.DataFrame(), {"invested":0,"market_value":0,"cash":0,"assets":0,"pnl":0,"return_pct":0})
+    st.subheader("💰 내 계좌 현황")
+    m1,m2,m3,m4,m5 = st.columns(5)
+    m1.metric("총 평가액", money(totals["assets"]))
+    m2.metric("투자원금", money(totals["invested"]))
+    m3.metric("평가손익", money(totals["pnl"]))
+    m4.metric("수익률", f"{totals['return_pct']:+.2f}%")
+    m5.metric("현금", money(totals["cash"]))
+    if not acct_rows.empty:
+        display = acct_rows.copy()
+        display["평단"] = display["평단"].map(money); display["현재가"] = display["현재가"].map(money)
+        display["평가액"] = display["평가액"].map(money); display["손익"] = display["손익"].map(money)
+        display["투자원금"] = display["투자원금"].map(money); display["현금"] = display["현금"].map(money)
+        display["수익률"] = display["수익률"].map(lambda x:f"{x:+.2f}%")
+        st.dataframe(display[["ETF","수량","평단","현재가","평가액","투자원금","손익","수익률","현금"]], use_container_width=True, hide_index=True)
+        st.caption("※ Trade Journal에서 매수/매도를 저장하면 수량·평단·현금이 자동으로 Accounts에 반영됩니다.")
+
     c1, c2 = st.columns(2)
     for col, label, res in [(c1,"TQQQ / QQQ",res_t),(c2,"SOXL / SOXX",res_s)]:
         mm = res["market"]
@@ -278,11 +332,15 @@ if page == "Dashboard":
         badge = "🚨 비상" if res["emergency"] else ("⚠️ 버블보험" if res["bubble"] else "정상")
         col.markdown(f'<div class="action"><h3>{ticker} <span class="{tone}">{badge}</span></h3><div class="big">목표 {res["target"]}% / 현금 {res["cash"]}%</div><p>{res["action"]}</p><div class="small">판정 근거: {res["reason"]}</div><div class="small">완료 월말 200MA 위 연속: {res["monthly"]["above_count"]}개월 · 최근 2주 위: {res["recovery"]["days_above"]}/10거래일</div></div>', unsafe_allow_html=True)
 
-    st.subheader("📊 전략 상태")
-    rows=[]
+    st.subheader("📊 목표 비중 vs 실제 비중")
+    alloc_rows=[]
+    total_assets = totals["assets"] or 0
     for t,res in [("TQQQ",res_t),("SOXL",res_s)]:
-        rows.append({"ETF":t,"현재 단계":f"Stage {res['stage']} · {res['stage_name']}","목표 비중":f"{res['target']}%","현금":f"{res['cash']}%","버블보험":"발동" if res['bubble'] else "정상","2주 복귀":f"{res['recovery']['days_above']}/10일"})
-    st.dataframe(table_rows(rows), use_container_width=True, hide_index=True)
+        row = acct_rows[acct_rows["ETF"]==t] if not acct_rows.empty else pd.DataFrame()
+        value = float(row["평가액"].iloc[0]) if not row.empty else 0.0
+        actual = value / total_assets * 100 if total_assets else 0.0
+        alloc_rows.append({"ETF":t,"목표 비중":f"{res['target']}%","실제 비중":f"{actual:.1f}%","차이":f"{actual-res['target']:+.1f}%p"})
+    st.dataframe(pd.DataFrame(alloc_rows), use_container_width=True, hide_index=True)
 
     st.subheader("🚨 비상 조건 모니터")
     e1,e2=st.columns(2)
@@ -335,7 +393,7 @@ elif page == "Accounts":
 # ---------- Trade Journal ----------
 elif page == "Trade Journal":
     st.title("📓 Trade Journal")
-    st.caption("매매 기록은 Supabase에 즉시 영구 저장됩니다.")
+    st.caption("매매 기록을 저장하면 Accounts의 수량·평단·현금이 자동으로 갱신됩니다.")
     if supabase is None:
         st.error("Supabase 연결 후 사용할 수 있습니다.")
     else:
@@ -348,8 +406,42 @@ elif page == "Trade Journal":
             reason=st.text_input("매매 이유", value=auto_res["reason"]); memo=st.text_area("메모")
             submitted=st.form_submit_button("매매 기록 추가", type="primary")
         if submitted:
-            ok=db_insert("trades",{"trade_date":str(date),"etf":etf,"side":side,"shares":shares,"price":price,"amount":shares*price,"stage":stage,"reason":reason,"memo":memo})
-            if ok: st.success("매매가 Supabase에 기록되었습니다."); st.rerun()
+            if shares <= 0 or price <= 0:
+                st.error("수량과 가격은 0보다 커야 합니다.")
+            else:
+                # Atomic DB function is preferred; fallback keeps compatibility with an existing V2 schema.
+                payload={"p_trade_date":str(date),"p_etf":etf,"p_side":side,"p_shares":float(shares),"p_price":float(price),"p_stage":stage,"p_reason":reason,"p_memo":memo}
+                ok=False
+                try:
+                    supabase.rpc("record_trade_and_update_account", payload).execute()
+                    ok=True
+                except Exception as rpc_error:
+                    # Fallback: insert trade, then recalculate account.
+                    try:
+                        supabase.table("trades").insert({"trade_date":str(date),"etf":etf,"side":side,"shares":float(shares),"price":float(price),"amount":float(shares*price),"stage":stage,"reason":reason,"memo":memo}).execute()
+                        acct=load_accounts()
+                        row=acct[acct["etf"]==etf]
+                        old_shares=float(row["shares"].iloc[0]) if not row.empty else 0.0
+                        old_avg=float(row["avg_cost"].iloc[0]) if not row.empty else 0.0
+                        old_cash=float(row["cash"].iloc[0]) if not row.empty else 0.0
+                        if side=="매수":
+                            new_shares=old_shares+shares
+                            new_avg=((old_shares*old_avg)+(shares*price))/new_shares if new_shares else 0.0
+                            new_cash=old_cash-shares*price
+                        else:
+                            if shares > old_shares + 1e-9:
+                                raise ValueError(f"매도 수량({shares:g})이 현재 보유수량({old_shares:g})보다 많습니다.")
+                            new_shares=old_shares-shares
+                            new_avg=old_avg if new_shares > 1e-9 else 0.0
+                            new_cash=old_cash+shares*price
+                        supabase.table("accounts").upsert({"etf":etf,"shares":new_shares,"avg_cost":new_avg,"cash":new_cash,"updated_at":datetime.utcnow().isoformat()}, on_conflict="etf").execute()
+                        ok=True
+                        st.info("기존 V2 스키마 호환 방식으로 계좌도 갱신했습니다. (권장: V2.2 SQL 함수 설치)")
+                    except Exception as fallback_error:
+                        st.error(f"매매 저장/계좌 반영 실패: {fallback_error}")
+        if ok:
+            st.success("매매 기록과 계좌 반영이 완료되었습니다.")
+            st.rerun()
         trades=db_select("trades",order=("trade_date",True))
         if not trades.empty:
             st.dataframe(trades.rename(columns={"trade_date":"날짜","etf":"ETF","side":"구분","shares":"수량","price":"가격","amount":"금액","stage":"단계","reason":"매매 이유","memo":"메모"}),use_container_width=True,hide_index=True)
