@@ -405,13 +405,13 @@ elif page == "Trade Journal":
             stage=st.selectbox("당시 단계",["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"], index=["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"].index(stage_default))
             reason=st.text_input("매매 이유", value=auto_res["reason"]); memo=st.text_area("메모")
             submitted=st.form_submit_button("매매 기록 추가", type="primary")
+        ok=False
         if submitted:
             if shares <= 0 or price <= 0:
                 st.error("수량과 가격은 0보다 커야 합니다.")
             else:
                 # Atomic DB function is preferred; fallback keeps compatibility with an existing V2 schema.
                 payload={"p_trade_date":str(date),"p_etf":etf,"p_side":side,"p_shares":float(shares),"p_price":float(price),"p_stage":stage,"p_reason":reason,"p_memo":memo}
-                ok=False
                 try:
                     supabase.rpc("record_trade_and_update_account", payload).execute()
                     ok=True
@@ -439,9 +439,9 @@ elif page == "Trade Journal":
                         st.info("기존 V2 스키마 호환 방식으로 계좌도 갱신했습니다. (권장: V2.2 SQL 함수 설치)")
                     except Exception as fallback_error:
                         st.error(f"매매 저장/계좌 반영 실패: {fallback_error}")
-        if ok:
-            st.success("매매 기록과 계좌 반영이 완료되었습니다.")
-            st.rerun()
+            if ok:
+                st.success("매매 기록과 계좌 반영이 완료되었습니다.")
+                st.rerun()
         trades=db_select("trades",order=("trade_date",True))
         if not trades.empty:
             st.dataframe(trades.rename(columns={"trade_date":"날짜","etf":"ETF","side":"구분","shares":"수량","price":"가격","amount":"금액","stage":"단계","reason":"매매 이유","memo":"메모"}),use_container_width=True,hide_index=True)
