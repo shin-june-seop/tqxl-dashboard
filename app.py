@@ -266,12 +266,10 @@ if page == "Dashboard":
     st.markdown('<div class="hero"><h1>Leveraged ETF Control Center</h1><p>TQQQ / SOXL 규칙 기반 운용 · 2주 점검 + 월중 비상대응 · Supabase 영구 저장</p></div>', unsafe_allow_html=True)
     if not supabase:
         st.warning("Supabase가 연결되지 않았습니다. Settings에서 Secrets를 설정하면 계좌/매매일지/스냅샷이 영구 저장됩니다.")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns(2)
     for col, label, res in [(c1,"TQQQ / QQQ",res_t),(c2,"SOXL / SOXX",res_s)]:
         mm = res["market"]
         col.markdown(f'<div class="card"><div class="card-title">{label} 시장 상태</div><div class="big">STAGE {res["stage"]} · {res["stage_name"]}</div><div>{money(mm["price"]) if mm else "데이터 없음"} · 200MA {money(mm["dma"]) if mm else "-"}</div><div class="small">200MA 이격: <b>{mm["dist"]:+.2f}%</b> · 기준일 {mm["date"] if mm else "-"}</div></div>', unsafe_allow_html=True)
-    c3.metric("TQQQ 목표 / 현금", f"{res_t['target']}% / {res_t['cash']}%")
-    c4.metric("SOXL 목표 / 현금", f"{res_s['target']}% / {res_s['cash']}%")
 
     st.subheader("🎯 지금 해야 할 일")
     a1, a2 = st.columns(2)
