@@ -32,7 +32,9 @@ st.markdown(
 .big {font-size:1.65rem; font-weight:700; margin-top:.25rem;}
 .good {color:#31d17c;} .warn {color:#f2b84b;} .bad {color:#ff6b6b;} .info {color:#6fa8ff;}
 .action {padding:1rem 1.1rem; border-radius:14px; border:1px solid #3c557a; background:#111d30;}
-.action h3 {margin-top:0;}
+.action h3 {margin-top:0; color:#ffffff;}
+.action p {color:#f1f5f9; font-size:1.02rem; line-height:1.55;}
+.action .small {color:#d7e0ec;}
 .stage {padding:.65rem .8rem; border-radius:10px; background:#151f2e; border:1px solid #29364e;}
 .small {font-size:.82rem; color:#98a6ba;}
 </style>
@@ -109,37 +111,64 @@ def metrics_for(df):
 
 
 def monthly_status(df):
+    """월말 규칙용 상태. 진행 중인 현재 월은 제외하고 완료된 월만 판단한다."""
     if df.empty or len(df) < 200:
-        return {"current_above": None, "prev_above": None, "below_count": 0, "months": pd.DataFrame()}
+        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0, "months": pd.DataFrame()}
     d = df[["Close"]].copy()
     d["dma200"] = d["Close"].rolling(200).mean()
     d = d.dropna()
-    m = d.resample("ME").last().dropna()
+    if d.empty:
+        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0, "months": pd.DataFrame()}
+
+    # 현재 월이 아직 끝나지 않았다면 월말 판정에서 제외한다.
+    month_end = d.resample("ME").last().dropna()
+    last_data_date = d.index[-1].date()
+    if month_end.index[-1].date().month == last_data_date.month and month_end.index[-1].date().year == last_data_date.year:
+        month_end = month_end.iloc[:-1]
+    m = month_end.copy()
+    if m.empty:
+        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0, "months": m}
     m["above"] = m["Close"] > m["dma200"]
+
     below_count = 0
     for v in reversed(m["above"].tolist()):
         if not v:
             below_count += 1
         else:
             break
+    above_count = 0
+    for v in reversed(m["above"].tolist()):
+        if v:
+            above_count += 1
+        else:
+            break
     return {
         "current_above": bool(m["above"].iloc[-1]),
         "prev_above": bool(m["above"].iloc[-2]) if len(m) >= 2 else None,
         "below_count": below_count,
+        "above_count": above_count,
         "months": m.tail(12),
     }
 
 
-def two_week_recovery(df):
-    if df.empty or len(df) < 10:
-        return False
+def recovery_status(df):
+    """상승 복귀: 최근 10거래일(약 2주) 연속 200MA 위 + 그 직전에는 200MA 아래였는지 확인."""
+    if df.empty or len(df) < 220:
+        return {"qualified": False, "days_above": 0, "recent_reclaim": False}
     s = df["Close"].astype(float)
     dma = s.rolling(200).mean()
     valid = pd.DataFrame({"close": s, "dma": dma}).dropna()
-    if len(valid) < 10:
-        return False
-    last = valid.tail(10)
-    return bool((last["close"] > last["dma"]).all())
+    if len(valid) < 25:
+        return {"qualified": False, "days_above": 0, "recent_reclaim": False}
+
+    last10 = valid.tail(10)
+    days_above = int((last10["close"] > last10["dma"]).sum())
+    recent_reclaim = bool((valid.iloc[-20:-10]["close"] <= valid.iloc[-20:-10]["dma"]).any())
+    return {
+        "qualified": bool(days_above == 10 and recent_reclaim),
+        "days_above": days_above,
+        "recent_reclaim": recent_reclaim,
+    }
 
 
 def determine(ticker, market_df, etf_df):
@@ -147,7 +176,7 @@ def determine(ticker, market_df, etf_df):
     mm = metrics_for(market_df)
     em = metrics_for(etf_df)
     ms = monthly_status(market_df)
-    recovery = two_week_recovery(market_df)
+    recovery = recovery_status(market_df)
     stage = 1
     reason = ""
     action = "현재 목표 비중 유지. 정상 점검 주기(2주)를 따릅니다."
@@ -159,12 +188,10 @@ def determine(ticker, market_df, etf_df):
         elif mm["dist"] <= r["emergency1"]:
             emergency = 1
 
-    # Recovery gets priority only when there is a sustained 2-week reclaim.
-    if recovery and mm and mm["dist"] is not None and mm["dist"] > 0:
-        stage = 5
-        reason = "200일선 위에서 2주 연속 회복 조건"
-        action = "상승 복귀 단계: 목표 비중 60% / 현금 40%. 가짜 반등 여부를 확인합니다."
-    elif emergency == 2:
+    # 월말 기준 200MA 위 1개월 이상이면 정상 강세장(Stage 1)이 최우선이다.
+    # Stage 5는 하락 후 재돌파하여 최근 10거래일(약 2주) 연속 위에 있는
+    # "회복 과정"에서만 잠시 사용한다.
+    if emergency == 2:
         stage = 4
         reason = f"월중 비상: {r['market']} 200MA 대비 {mm['dist']:.1f}% 이탈"
         action = f"월말까지 기다리지 않고 즉시 {ticker} 비중을 {r['stages'][3][2]}%로 축소, 현금 {r['stages'][3][3]}% 확보."
@@ -180,6 +207,14 @@ def determine(ticker, market_df, etf_df):
         stage = 2
         reason = "월말 기준 200일선 첫 이탈"
         action = f"{ticker} 비중을 {r['stages'][1][2]}%로 축소하고 현금 {r['stages'][1][3]}% 확보."
+    elif ms["above_count"] >= 1:
+        stage = 1
+        reason = "완료된 최근 월말 기준 200일선 위에서 1개월 이상 유지"
+        action = f"{ticker} 목표 비중 {r['stages'][0][2]}% 유지. 과열도와 비상버튼만 감시."
+    elif recovery["qualified"] and mm and mm["dist"] is not None and mm["dist"] > 0:
+        stage = 5
+        reason = "하락 후 200일선 재돌파 + 최근 10거래일(약 2주) 연속 200일선 위"
+        action = "상승 복귀 단계: 목표 비중 60% / 현금 40%. 1개월 이상 강세장 확인 전까지 가짜 반등 여부를 확인합니다."
     elif ms["current_above"] is True:
         stage = 1
         reason = "월말 기준 200일선 위에서 강세장 유지"
@@ -231,12 +266,12 @@ if page == "Dashboard":
     for col, ticker, res in [(a1,"TQQQ",res_t),(a2,"SOXL",res_s)]:
         tone = "bad" if res["bubble"] or res["emergency"] else ("warn" if res["stage"] in [2,3,4] else "good")
         badge = "🚨 비상" if res["emergency"] else ("⚠️ 버블보험" if res["bubble"] else "정상")
-        col.markdown(f'<div class="action"><h3>{ticker} <span class="{tone}">{badge}</span></h3><div class="big">목표 {res["target"]}% / 현금 {res["cash"]}%</div><p>{res["action"]}</p><div class="small">판정 근거: {res["reason"]}</div></div>', unsafe_allow_html=True)
+        col.markdown(f'<div class="action"><h3>{ticker} <span class="{tone}">{badge}</span></h3><div class="big">목표 {res["target"]}% / 현금 {res["cash"]}%</div><p>{res["action"]}</p><div class="small">판정 근거: {res["reason"]}</div><div class="small">완료 월말 200MA 위 연속: {res["monthly"]["above_count"]}개월 · 최근 2주 위: {res["recovery"]["days_above"]}/10거래일</div></div>', unsafe_allow_html=True)
 
     st.subheader("📊 전략 상태")
     rows=[]
     for t,res in [("TQQQ",res_t),("SOXL",res_s)]:
-        rows.append({"ETF":t,"현재 단계":f"Stage {res['stage']} · {res['stage_name']}","목표 비중":f"{res['target']}%","현금":f"{res['cash']}%","버블보험":"발동" if res['bubble'] else "정상","2주 복귀":"충족" if res['recovery'] else "미충족"})
+        rows.append({"ETF":t,"현재 단계":f"Stage {res['stage']} · {res['stage_name']}","목표 비중":f"{res['target']}%","현금":f"{res['cash']}%","버블보험":"발동" if res['bubble'] else "정상","2주 복귀":f"{res['recovery']['days_above']}/10일" if res['recovery']['days_above'] else "미충족"})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     st.subheader("🚨 비상 조건 모니터")
