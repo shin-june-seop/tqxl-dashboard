@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -10,14 +10,15 @@ try:
 except ImportError:
     yf = None
 
-APP_VERSION = "V1"
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-TRADES_FILE = DATA_DIR / "trades.csv"
-ACCOUNT_FILE = DATA_DIR / "account.csv"
-SNAPSHOT_FILE = DATA_DIR / "snapshots.csv"
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client = None
+    Client = object
 
-st.set_page_config(page_title="TQQQ / SOXL Control Center V1", page_icon="📈", layout="wide")
+APP_VERSION = "V2"
+
+st.set_page_config(page_title="TQQQ / SOXL Control Center V2", page_icon="📈", layout="wide")
 
 # ---------- Styling ----------
 st.markdown(
@@ -26,20 +27,43 @@ st.markdown(
 .block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1500px;}
 .hero {padding: 1.1rem 1.3rem; border-radius: 16px; background: linear-gradient(135deg,#101827,#182338); border:1px solid #29364e;}
 .hero h1 {margin:0; font-size:2rem;}
-.hero p {margin:.35rem 0 0; color:#aab7ca;}
+.hero p {margin:.35rem 0 0; color:#dbe5f2;}
 .card {padding:1rem 1.05rem; border-radius:14px; border:1px solid #29364e; background:#101722; min-height:130px;}
-.card-title {color:#9eabc0; font-size:.82rem; text-transform:uppercase; letter-spacing:.04em;}
+.card-title {color:#c8d3e2; font-size:.82rem; text-transform:uppercase; letter-spacing:.04em;}
 .big {font-size:1.65rem; font-weight:700; margin-top:.25rem;}
 .good {color:#31d17c;} .warn {color:#f2b84b;} .bad {color:#ff6b6b;} .info {color:#6fa8ff;}
 .action {padding:1rem 1.1rem; border-radius:14px; border:1px solid #3c557a; background:#111d30;}
 .action h3 {margin-top:0; color:#ffffff;}
-.action p {color:#f1f5f9; font-size:1.02rem; line-height:1.55;}
-.action .small {color:#d7e0ec;}
-.stage {padding:.65rem .8rem; border-radius:10px; background:#151f2e; border:1px solid #29364e;}
-.small {font-size:.82rem; color:#98a6ba;}
+.action p {color:#ffffff; font-size:1.02rem; line-height:1.55;}
+.action .small {color:#e5edf7;}
+.small {font-size:.82rem; color:#c9d4e2;}
+.successbox {padding:1rem; border-radius:12px; border:1px solid #2d7650; background:#10251b; color:#f0fff6;}
+.warnbox {padding:1rem; border-radius:12px; border:1px solid #8a6a2b; background:#292210; color:#fff7df;}
+.errorbox {padding:1rem; border-radius:12px; border:1px solid #8d3b3b; background:#2b1515; color:#fff0f0;}
 </style>
 """, unsafe_allow_html=True,
 )
+
+# ---------- Supabase ----------
+@st.cache_resource
+def get_supabase():
+    if create_client is None:
+        return None, "supabase package is not installed."
+    try:
+        secrets = st.secrets
+        url = secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+        key = secrets.get("SUPABASE_SERVICE_ROLE_KEY", secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_KEY", ""))))
+    except Exception:
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_KEY", ""))
+    if not url or not key:
+        return None, "Supabase Secrets가 설정되지 않았습니다."
+    try:
+        return create_client(url, key), None
+    except Exception as e:
+        return None, f"Supabase 연결 실패: {e}"
+
+supabase, sb_error = get_supabase()
 
 # ---------- Strategy ----------
 RULES = {
@@ -58,20 +82,6 @@ RULES = {
 }
 
 
-def load_csv(path, columns):
-    if path.exists():
-        try:
-            df = pd.read_csv(path)
-            return df
-        except Exception:
-            pass
-    return pd.DataFrame(columns=columns)
-
-
-def save_csv(df, path):
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-
-
 def fetch_history(ticker, period="3y", interval="1d"):
     if yf is None:
         return pd.DataFrame()
@@ -82,7 +92,8 @@ def fetch_history(ticker, period="3y", interval="1d"):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.rename(columns={c: c.title() for c in df.columns})
-        df.index = pd.to_datetime(df.index).tz_localize(None) if getattr(df.index, "tz", None) else pd.to_datetime(df.index)
+        idx = pd.to_datetime(df.index)
+        df.index = idx.tz_localize(None) if getattr(idx, "tz", None) else idx
         return df.dropna(subset=["Close"])
     except Exception as e:
         st.warning(f"{ticker} 데이터 조회 실패: {e}")
@@ -91,10 +102,7 @@ def fetch_history(ticker, period="3y", interval="1d"):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_market_data():
-    result = {}
-    for t in ["QQQ", "SOXX", "TQQQ", "SOXL"]:
-        result[t] = fetch_history(t, "3y", "1d")
-    return result
+    return {t: fetch_history(t, "3y", "1d") for t in ["QQQ", "SOXX", "TQQQ", "SOXL"]}
 
 
 def metrics_for(df):
@@ -102,57 +110,38 @@ def metrics_for(df):
         return None
     s = df["Close"].astype(float)
     dma = s.rolling(200).mean()
-    return {
-        "price": float(s.iloc[-1]),
-        "dma": float(dma.iloc[-1]) if pd.notna(dma.iloc[-1]) else None,
-        "dist": float((s.iloc[-1] / dma.iloc[-1] - 1) * 100) if pd.notna(dma.iloc[-1]) else None,
-        "date": s.index[-1].date(),
-    }
+    if pd.isna(dma.iloc[-1]):
+        return None
+    return {"price": float(s.iloc[-1]), "dma": float(dma.iloc[-1]), "dist": float((s.iloc[-1] / dma.iloc[-1] - 1) * 100), "date": s.index[-1].date()}
 
 
 def monthly_status(df):
-    """월말 규칙용 상태. 진행 중인 현재 월은 제외하고 완료된 월만 판단한다."""
     if df.empty or len(df) < 200:
-        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0, "months": pd.DataFrame()}
+        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0}
     d = df[["Close"]].copy()
     d["dma200"] = d["Close"].rolling(200).mean()
     d = d.dropna()
     if d.empty:
-        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0, "months": pd.DataFrame()}
-
-    # 현재 월이 아직 끝나지 않았다면 월말 판정에서 제외한다.
+        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0}
     month_end = d.resample("ME").last().dropna()
     last_data_date = d.index[-1].date()
     if month_end.index[-1].date().month == last_data_date.month and month_end.index[-1].date().year == last_data_date.year:
         month_end = month_end.iloc[:-1]
-    m = month_end.copy()
-    if m.empty:
-        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0, "months": m}
-    m["above"] = m["Close"] > m["dma200"]
-
+    if month_end.empty:
+        return {"current_above": None, "prev_above": None, "below_count": 0, "above_count": 0}
+    month_end["above"] = month_end["Close"] > month_end["dma200"]
     below_count = 0
-    for v in reversed(m["above"].tolist()):
-        if not v:
-            below_count += 1
-        else:
-            break
+    for v in reversed(month_end["above"].tolist()):
+        if not v: below_count += 1
+        else: break
     above_count = 0
-    for v in reversed(m["above"].tolist()):
-        if v:
-            above_count += 1
-        else:
-            break
-    return {
-        "current_above": bool(m["above"].iloc[-1]),
-        "prev_above": bool(m["above"].iloc[-2]) if len(m) >= 2 else None,
-        "below_count": below_count,
-        "above_count": above_count,
-        "months": m.tail(12),
-    }
+    for v in reversed(month_end["above"].tolist()):
+        if v: above_count += 1
+        else: break
+    return {"current_above": bool(month_end["above"].iloc[-1]), "prev_above": bool(month_end["above"].iloc[-2]) if len(month_end) >= 2 else None, "below_count": below_count, "above_count": above_count}
 
 
 def recovery_status(df):
-    """상승 복귀: 최근 10거래일(약 2주) 연속 200MA 위 + 그 직전에는 200MA 아래였는지 확인."""
     if df.empty or len(df) < 220:
         return {"qualified": False, "days_above": 0, "recent_reclaim": False}
     s = df["Close"].astype(float)
@@ -160,87 +149,111 @@ def recovery_status(df):
     valid = pd.DataFrame({"close": s, "dma": dma}).dropna()
     if len(valid) < 25:
         return {"qualified": False, "days_above": 0, "recent_reclaim": False}
-
     last10 = valid.tail(10)
     days_above = int((last10["close"] > last10["dma"]).sum())
     recent_reclaim = bool((valid.iloc[-20:-10]["close"] <= valid.iloc[-20:-10]["dma"]).any())
-    return {
-        "qualified": bool(days_above == 10 and recent_reclaim),
-        "days_above": days_above,
-        "recent_reclaim": recent_reclaim,
-    }
+    return {"qualified": bool(days_above == 10 and recent_reclaim), "days_above": days_above, "recent_reclaim": recent_reclaim}
 
 
 def determine(ticker, market_df, etf_df):
     r = RULES[ticker]
-    mm = metrics_for(market_df)
-    em = metrics_for(etf_df)
-    ms = monthly_status(market_df)
-    recovery = recovery_status(market_df)
-    stage = 1
-    reason = ""
-    action = "현재 목표 비중 유지. 정상 점검 주기(2주)를 따릅니다."
-    emergency = None
-
-    if mm and mm["dist"] is not None:
-        if mm["dist"] <= r["emergency2"]:
-            emergency = 2
-        elif mm["dist"] <= r["emergency1"]:
-            emergency = 1
-
-    # 월말 기준 200MA 위 1개월 이상이면 정상 강세장(Stage 1)이 최우선이다.
-    # Stage 5는 하락 후 재돌파하여 최근 10거래일(약 2주) 연속 위에 있는
-    # "회복 과정"에서만 잠시 사용한다.
+    mm, em, ms, recovery = metrics_for(market_df), metrics_for(etf_df), monthly_status(market_df), recovery_status(market_df)
+    stage, reason, action, emergency = 1, "", "현재 목표 비중 유지. 정상 점검 주기(2주)를 따릅니다.", None
+    if mm:
+        if mm["dist"] <= r["emergency2"]: emergency = 2
+        elif mm["dist"] <= r["emergency1"]: emergency = 1
     if emergency == 2:
-        stage = 4
-        reason = f"월중 비상: {r['market']} 200MA 대비 {mm['dist']:.1f}% 이탈"
+        stage, reason = 4, f"월중 비상: {r['market']} 200MA 대비 {mm['dist']:.1f}% 이탈"
         action = f"월말까지 기다리지 않고 즉시 {ticker} 비중을 {r['stages'][3][2]}%로 축소, 현금 {r['stages'][3][3]}% 확보."
     elif emergency == 1:
-        stage = 3
-        reason = f"월중 비상: {r['market']} 200MA 대비 {mm['dist']:.1f}% 이탈"
+        stage, reason = 3, f"월중 비상: {r['market']} 200MA 대비 {mm['dist']:.1f}% 이탈"
         action = f"월말까지 기다리지 않고 즉시 {ticker} 비중을 {r['stages'][2][2]}%로 축소, 현금 {r['stages'][2][3]}% 확보."
     elif ms["current_above"] is False and ms["below_count"] >= (2 if ticker == "TQQQ" else 1):
-        stage = 3
-        reason = r["stage3_text"]
+        stage, reason = 3, r["stage3_text"]
         action = f"{ticker} 비중을 {r['stages'][2][2]}%로 축소하고 현금 {r['stages'][2][3]}% 확보."
     elif ms["current_above"] is False and ms["prev_above"] is True:
-        stage = 2
-        reason = "월말 기준 200일선 첫 이탈"
+        stage, reason = 2, "완료된 월말 기준 200일선 첫 이탈"
         action = f"{ticker} 비중을 {r['stages'][1][2]}%로 축소하고 현금 {r['stages'][1][3]}% 확보."
     elif ms["above_count"] >= 1:
-        stage = 1
-        reason = "완료된 최근 월말 기준 200일선 위에서 1개월 이상 유지"
+        stage, reason = 1, "완료된 최근 월말 기준 200일선 위에서 1개월 이상 유지"
         action = f"{ticker} 목표 비중 {r['stages'][0][2]}% 유지. 과열도와 비상버튼만 감시."
-    elif recovery["qualified"] and mm and mm["dist"] is not None and mm["dist"] > 0:
-        stage = 5
-        reason = "하락 후 200일선 재돌파 + 최근 10거래일(약 2주) 연속 200일선 위"
-        action = "상승 복귀 단계: 목표 비중 60% / 현금 40%. 1개월 이상 강세장 확인 전까지 가짜 반등 여부를 확인합니다."
+    elif recovery["qualified"] and mm and mm["dist"] > 0:
+        stage, reason = 5, "하락 후 200일선 재돌파 + 최근 10거래일(약 2주) 연속 200일선 위"
+        action = "상승 복귀 단계: 목표 비중 60% / 현금 40%. 완료된 월말 200MA 위 1개월 확인 전까지 가짜 반등 여부를 확인합니다."
     elif ms["current_above"] is True:
-        stage = 1
-        reason = "월말 기준 200일선 위에서 강세장 유지"
-        action = f"{ticker} 목표 비중 {r['stages'][0][2]}% 유지. 과열도와 비상버튼만 감시."
-
-    bubble = em["dist"] is not None and em["dist"] >= r["bubble"]
+        stage, reason = 1, "최근 완료 월말 기준 200일선 위"
+        action = f"{ticker} 목표 비중 {r['stages'][0][2]}% 유지."
+    bubble = bool(em and em["dist"] >= r["bubble"])
     if bubble:
         action = f"⚠️ 버블보험 발동: {ticker} 비중을 60% 수준으로 낮추고 초과분을 현금화합니다."
-
     target = next(x[2] for x in r["stages"] if x[0] == stage)
-    cash = 100 - target
-    return {"stage": stage, "stage_name": next(x[1] for x in r["stages"] if x[0] == stage), "target": target, "cash": cash,
-            "reason": reason, "action": action, "bubble": bubble, "market": mm, "etf": em, "monthly": ms, "recovery": recovery,
-            "emergency": emergency}
+    return {"stage": stage, "stage_name": next(x[1] for x in r["stages"] if x[0] == stage), "target": target, "cash": 100-target, "reason": reason, "action": action, "bubble": bubble, "market": mm, "etf": em, "monthly": ms, "recovery": recovery, "emergency": emergency}
 
 
-def money(x):
-    return f"${x:,.2f}"
+def money(x): return f"${x:,.2f}"
+
+
+def table_rows(data):
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+# ---------- DB helpers ----------
+def db_select(table, columns="*", order=None):
+    if supabase is None:
+        return pd.DataFrame()
+    try:
+        q = supabase.table(table).select(columns)
+        if order:
+            q = q.order(order[0], desc=order[1])
+        res = q.execute()
+        return pd.DataFrame(res.data or [])
+    except Exception as e:
+        st.error(f"Supabase 조회 오류 ({table}): {e}")
+        return pd.DataFrame()
+
+
+def db_upsert(table, payload, on_conflict=None):
+    if supabase is None:
+        return False
+    try:
+        q = supabase.table(table).upsert(payload, on_conflict=on_conflict) if on_conflict else supabase.table(table).upsert(payload)
+        q.execute()
+        return True
+    except Exception as e:
+        st.error(f"Supabase 저장 오류 ({table}): {e}")
+        return False
+
+
+def db_insert(table, payload):
+    if supabase is None:
+        return False
+    try:
+        supabase.table(table).insert(payload).execute()
+        return True
+    except Exception as e:
+        st.error(f"Supabase 입력 오류 ({table}): {e}")
+        return False
+
+
+def load_accounts():
+    df = db_select("accounts")
+    if df.empty:
+        return pd.DataFrame([{"etf":"TQQQ","shares":0.0,"avg_cost":0.0,"cash":0.0},{"etf":"SOXL","shares":0.0,"avg_cost":0.0,"cash":0.0}])
+    for c in ["shares","avg_cost","cash"]:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    return df[[c for c in ["etf","shares","avg_cost","cash"] if c in df.columns]]
+
 
 # ---------- Sidebar ----------
 with st.sidebar:
     st.title("📈 TQQQ / SOXL")
     page = st.radio("메뉴", ["Dashboard", "Accounts", "Trade Journal", "Performance", "Strategy / Rules", "Alerts", "Settings"])
     st.caption(f"Version {APP_VERSION}")
+    if supabase:
+        st.success("Supabase 연결됨")
+    else:
+        st.error("Supabase 미연결")
     if st.button("🔄 시장 데이터 새로고침"):
-        st.cache_data.clear()
+        get_market_data.clear()
         st.rerun()
 
 # ---------- Data ----------
@@ -250,14 +263,13 @@ res_s = determine("SOXL", market_data["SOXX"], market_data["SOXL"])
 
 # ---------- Dashboard ----------
 if page == "Dashboard":
-    st.markdown('<div class="hero"><h1>Leveraged ETF Control Center</h1><p>TQQQ / SOXL 규칙 기반 운용 대시보드 · 2주 점검 + 월중 비상대응</p></div>', unsafe_allow_html=True)
-    st.write("")
-
-    # Top market cards
+    st.markdown('<div class="hero"><h1>Leveraged ETF Control Center</h1><p>TQQQ / SOXL 규칙 기반 운용 · 2주 점검 + 월중 비상대응 · Supabase 영구 저장</p></div>', unsafe_allow_html=True)
+    if not supabase:
+        st.warning("Supabase가 연결되지 않았습니다. Settings에서 Secrets를 설정하면 계좌/매매일지/스냅샷이 영구 저장됩니다.")
     c1, c2, c3, c4 = st.columns(4)
     for col, label, res in [(c1,"TQQQ / QQQ",res_t),(c2,"SOXL / SOXX",res_s)]:
         mm = res["market"]
-        col.markdown(f'<div class="card"><div class="card-title">{label} 시장 상태</div><div class="big">STAGE {res["stage"]} · {res["stage_name"]}</div><div>{money(mm["price"]) if mm else "데이터 없음"} · 200MA {money(mm["dma"]) if mm and mm["dma"] else "-"}</div><div class="small">200MA 이격: <b>{mm["dist"]:+.2f}%</b> · 기준일 {mm["date"] if mm else "-"}</div></div>', unsafe_allow_html=True)
+        col.markdown(f'<div class="card"><div class="card-title">{label} 시장 상태</div><div class="big">STAGE {res["stage"]} · {res["stage_name"]}</div><div>{money(mm["price"]) if mm else "데이터 없음"} · 200MA {money(mm["dma"]) if mm else "-"}</div><div class="small">200MA 이격: <b>{mm["dist"]:+.2f}%</b> · 기준일 {mm["date"] if mm else "-"}</div></div>', unsafe_allow_html=True)
     c3.metric("TQQQ 목표 / 현금", f"{res_t['target']}% / {res_t['cash']}%")
     c4.metric("SOXL 목표 / 현금", f"{res_s['target']}% / {res_s['cash']}%")
 
@@ -271,8 +283,8 @@ if page == "Dashboard":
     st.subheader("📊 전략 상태")
     rows=[]
     for t,res in [("TQQQ",res_t),("SOXL",res_s)]:
-        rows.append({"ETF":t,"현재 단계":f"Stage {res['stage']} · {res['stage_name']}","목표 비중":f"{res['target']}%","현금":f"{res['cash']}%","버블보험":"발동" if res['bubble'] else "정상","2주 복귀":f"{res['recovery']['days_above']}/10일" if res['recovery']['days_above'] else "미충족"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        rows.append({"ETF":t,"현재 단계":f"Stage {res['stage']} · {res['stage_name']}","목표 비중":f"{res['target']}%","현금":f"{res['cash']}%","버블보험":"발동" if res['bubble'] else "정상","2주 복귀":f"{res['recovery']['days_above']}/10일"})
+    st.dataframe(table_rows(rows), use_container_width=True, hide_index=True)
 
     st.subheader("🚨 비상 조건 모니터")
     e1,e2=st.columns(2)
@@ -283,91 +295,101 @@ if page == "Dashboard":
 
     st.subheader("📈 최근 시장 흐름")
     chart_df = pd.DataFrame({"QQQ": market_data["QQQ"]["Close"], "SOXX": market_data["SOXX"]["Close"]}).dropna().tail(252)
-    if not chart_df.empty:
-        st.line_chart(chart_df)
+    if not chart_df.empty: st.line_chart(chart_df)
 
-    st.caption("※ V1은 규칙을 자동 계산해 행동을 제시하는 도구입니다. 실제 주문은 사용자가 확인 후 실행하세요.")
+    if supabase:
+        if st.button("📸 오늘의 전략 스냅샷 저장", type="primary"):
+            today = str(datetime.now().date())
+            payload=[]
+            for ticker,res in [("TQQQ",res_t),("SOXL",res_s)]:
+                payload.append({"snapshot_date":today,"etf":ticker,"market_ticker":RULES[ticker]["market"],"market_price":res["market"]["price"] if res["market"] else None,"market_200ma":res["market"]["dma"] if res["market"] else None,"market_dist":res["market"]["dist"] if res["market"] else None,"etf_price":res["etf"]["price"] if res["etf"] else None,"etf_200ma":res["etf"]["dma"] if res["etf"] else None,"etf_dist":res["etf"]["dist"] if res["etf"] else None,"stage":res["stage"],"stage_name":res["stage_name"],"target_pct":res["target"],"cash_pct":res["cash"],"emergency":res["emergency"],"bubble":res["bubble"],"reason":res["reason"],"action":res["action"]})
+            if db_upsert("snapshots",payload,"snapshot_date,etf"): st.success("오늘의 TQQQ / SOXL 전략 상태가 Supabase에 저장되었습니다.")
+    st.caption("※ 실제 주문은 규칙과 계좌 상태를 확인한 후 사용자가 실행하세요.")
 
 # ---------- Accounts ----------
 elif page == "Accounts":
     st.title("💰 Accounts")
-    st.caption("평단가·보유수량·현재가·평가액·수익률을 입력/관리합니다.")
-    acct = load_csv(ACCOUNT_FILE, ["ETF","Shares","Avg Cost","Cash"])
-    if acct.empty:
-        acct = pd.DataFrame([{"ETF":"TQQQ","Shares":0.0,"Avg Cost":0.0,"Cash":0.0},{"ETF":"SOXL","Shares":0.0,"Avg Cost":0.0,"Cash":0.0}])
-    edited = st.data_editor(acct, num_rows="fixed", use_container_width=True, key="account_editor")
-    if st.button("💾 계좌 저장", type="primary"):
-        save_csv(edited, ACCOUNT_FILE); st.success("계좌 정보가 저장되었습니다.")
-    rows=[]
-    total_value=0; total_cost=0
-    for _,r in edited.iterrows():
-        t=r["ETF"]; price=market_data.get(t,pd.DataFrame())
-        cur=float(price["Close"].iloc[-1]) if not price.empty else 0
-        shares=float(r["Shares"] or 0); avg=float(r["Avg Cost"] or 0); cash=float(r["Cash"] or 0)
-        value=shares*cur; cost=shares*avg; pnl=value-cost
-        total_value += value+cash; total_cost += cost
-        rows.append({"ETF":t,"수량":shares,"평단":money(avg),"현재가":money(cur),"평가액":money(value),"손익":money(pnl),"수익률":f"{pnl/cost*100:+.2f}%" if cost else "-"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    m1,m2,m3=st.columns(3)
-    m1.metric("총 평가액", money(total_value))
-    m2.metric("총 투자원금", money(total_cost))
-    m3.metric("총 손익", money(total_value-total_cost))
+    st.caption("Supabase에 영구 저장되는 실제 계좌 현황입니다.")
+    if supabase is None:
+        st.error("Supabase 연결 후 사용할 수 있습니다.")
+    else:
+        acct = load_accounts()
+        view = acct.rename(columns={"etf":"ETF","shares":"보유수량","avg_cost":"평단가","cash":"현금"})
+        edited = st.data_editor(view, num_rows="fixed", use_container_width=True, key="account_editor", column_config={"ETF":st.column_config.TextColumn(disabled=True),"보유수량":st.column_config.NumberColumn(min_value=0.0),"평단가":st.column_config.NumberColumn(min_value=0.0,format="$%.2f"),"현금":st.column_config.NumberColumn(min_value=0.0,format="$%.2f")})
+        if st.button("💾 계좌 저장", type="primary"):
+            payload=[]
+            for _,r in edited.iterrows():
+                payload.append({"etf":str(r["ETF"]),"shares":float(r["보유수량"] or 0),"avg_cost":float(r["평단가"] or 0),"cash":float(r["현금"] or 0),"updated_at":datetime.utcnow().isoformat()})
+            if db_upsert("accounts",payload,"etf"):
+                st.success("계좌 정보가 Supabase에 저장되었습니다.")
+                st.rerun()
+        rows=[]; total_value=0; total_cost=0; total_cash=0
+        for _,r in edited.iterrows():
+            t=str(r["ETF"]); df=market_data.get(t,pd.DataFrame()); cur=float(df["Close"].iloc[-1]) if not df.empty else 0
+            shares=float(r["보유수량"] or 0); avg=float(r["평단가"] or 0); cash=float(r["현금"] or 0)
+            value=shares*cur; cost=shares*avg; pnl=value-cost
+            total_value += value; total_cost += cost; total_cash += cash
+            rows.append({"ETF":t,"수량":shares,"평단":money(avg),"현재가":money(cur),"평가액":money(value),"손익":money(pnl),"수익률":f"{pnl/cost*100:+.2f}%" if cost else "-","현금":money(cash)})
+        st.dataframe(table_rows(rows), use_container_width=True, hide_index=True)
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("총 평가액", money(total_value+total_cash)); m2.metric("총 투자원금", money(total_cost)); m3.metric("총 손익", money(total_value-total_cost)); m4.metric("현금", money(total_cash))
 
 # ---------- Trade Journal ----------
 elif page == "Trade Journal":
     st.title("📓 Trade Journal")
-    st.caption("매매 이유와 당시 전략 단계를 함께 기록합니다.")
-    trades=load_csv(TRADES_FILE,["Date","ETF","Side","Shares","Price","Amount","Stage","Reason","Memo"])
-    with st.form("trade_form"):
-        c=st.columns(5)
-        date=c[0].date_input("날짜", datetime.now().date())
-        etf=c[1].selectbox("ETF",["TQQQ","SOXL"])
-        side=c[2].selectbox("구분",["매수","매도"])
-        shares=c[3].number_input("수량",min_value=0.0,step=1.0)
-        price=c[4].number_input("가격",min_value=0.0,step=0.01)
-        stage=st.selectbox("당시 단계",["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"])
-        reason=st.text_input("매매 이유")
-        memo=st.text_area("메모")
-        submitted=st.form_submit_button("매매 기록 추가", type="primary")
-    if submitted:
-        new=pd.DataFrame([{"Date":str(date),"ETF":etf,"Side":side,"Shares":shares,"Price":price,"Amount":shares*price,"Stage":stage,"Reason":reason,"Memo":memo}])
-        trades=pd.concat([trades,new],ignore_index=True); save_csv(trades,TRADES_FILE); st.success("매매가 기록되었습니다."); st.rerun()
-    st.dataframe(trades.sort_values("Date",ascending=False) if not trades.empty else trades, use_container_width=True, hide_index=True)
+    st.caption("매매 기록은 Supabase에 즉시 영구 저장됩니다.")
+    if supabase is None:
+        st.error("Supabase 연결 후 사용할 수 있습니다.")
+    else:
+        with st.form("trade_form"):
+            c=st.columns(5)
+            date=c[0].date_input("날짜", datetime.now().date()); etf=c[1].selectbox("ETF",["TQQQ","SOXL"]); side=c[2].selectbox("구분",["매수","매도"]); shares=c[3].number_input("수량",min_value=0.0,step=1.0); price=c[4].number_input("가격",min_value=0.0,step=0.01)
+            auto_res = res_t if etf=="TQQQ" else res_s
+            stage_default=f"Stage {auto_res['stage']}"
+            stage=st.selectbox("당시 단계",["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"], index=["Stage 1","Stage 2","Stage 3","Stage 4","Stage 5","버블보험","월중 비상"].index(stage_default))
+            reason=st.text_input("매매 이유", value=auto_res["reason"]); memo=st.text_area("메모")
+            submitted=st.form_submit_button("매매 기록 추가", type="primary")
+        if submitted:
+            ok=db_insert("trades",{"trade_date":str(date),"etf":etf,"side":side,"shares":shares,"price":price,"amount":shares*price,"stage":stage,"reason":reason,"memo":memo})
+            if ok: st.success("매매가 Supabase에 기록되었습니다."); st.rerun()
+        trades=db_select("trades",order=("trade_date",True))
+        if not trades.empty:
+            st.dataframe(trades.rename(columns={"trade_date":"날짜","etf":"ETF","side":"구분","shares":"수량","price":"가격","amount":"금액","stage":"단계","reason":"매매 이유","memo":"메모"}),use_container_width=True,hide_index=True)
+        else: st.info("아직 매매일지가 없습니다.")
 
 # ---------- Performance ----------
 elif page == "Performance":
     st.title("📊 Performance")
-    acct=load_csv(ACCOUNT_FILE,["ETF","Shares","Avg Cost","Cash"])
-    if acct.empty:
-        st.info("Accounts 메뉴에서 보유수량과 평단가를 먼저 입력하세요.")
+    if supabase is None:
+        st.error("Supabase 연결 후 사용할 수 있습니다.")
     else:
-        perf=[]
+        acct=load_accounts(); perf=[]
         for _,r in acct.iterrows():
-            t=r["ETF"]; df=market_data.get(t,pd.DataFrame())
+            t=r["etf"]; df=market_data.get(t,pd.DataFrame())
             if df.empty: continue
-            cur=float(df["Close"].iloc[-1]); avg=float(r["Avg Cost"]); shares=float(r["Shares"])
-            pnl=(cur-avg)*shares; cost=avg*shares
-            perf.append({"ETF":t,"수익률":pnl/cost*100 if cost else 0,"평가손익":pnl})
+            cur=float(df["Close"].iloc[-1]); avg=float(r["avg_cost"]); shares=float(r["shares"]); pnl=(cur-avg)*shares; cost=avg*shares
+            perf.append({"ETF":t,"수익률":pnl/cost*100 if cost else 0,"평가손익":pnl,"평가액":cur*shares})
         if perf:
-            p=pd.DataFrame(perf)
-            st.dataframe(p, use_container_width=True, hide_index=True)
-            st.bar_chart(p.set_index("ETF")["수익률"])
+            p=pd.DataFrame(perf); st.dataframe(p,use_container_width=True,hide_index=True); st.bar_chart(p.set_index("ETF")["수익률"])
+        snaps=db_select("snapshots",order=("snapshot_date",True))
+        if not snaps.empty:
+            st.subheader("📸 전략 스냅샷 기록")
+            st.dataframe(snaps[["snapshot_date","etf","stage","stage_name","target_pct","cash_pct","market_dist","etf_dist"]].rename(columns={"snapshot_date":"날짜","etf":"ETF","stage":"단계","stage_name":"단계명","target_pct":"목표비중","cash_pct":"현금비중","market_dist":"시장 이격","etf_dist":"ETF 이격"}),use_container_width=True,hide_index=True)
 
 # ---------- Rules ----------
 elif page == "Strategy / Rules":
     st.title("🛡️ Strategy / Rules")
+    st.info("현재 V2는 아래 규칙을 코드에 고정하여 전략 자체가 임의로 바뀌지 않도록 했습니다.")
     for ticker in ["TQQQ","SOXL"]:
-        r=RULES[ticker]
-        st.subheader(ticker)
-        data=[]
+        r=RULES[ticker]; st.subheader(ticker); data=[]
         for n,name,target,cash in r["stages"]:
-            if n==5: cond="200일선 재돌파 2주차"
-            elif n==1: cond=f"{r['market']} > 200일선 (1개월 이상)"
-            elif n==2: cond="200일선 첫 이탈"
+            if n==5: cond="하락 후 200일선 재돌파 + 최근 10거래일(약 2주) 연속 200MA 위. 이후 완료 월말 1개월 위면 Stage 1(80%)으로 승격."
+            elif n==1: cond=f"{r['market']} > 200일선 (완료 월말 기준 1개월 이상)"
+            elif n==2: cond="완료 월말 기준 200일선 첫 이탈"
             elif n==3: cond=r["stage3_text"]
             else: cond=f"{r['market']} 200일선 대비 -25% 이상 급락"
-            data.append({"단계":f"Stage {n}","조건":cond,"{0} 비중".format(ticker):f"{target}%","현금":f"{cash}%"})
-        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+            data.append({"단계":f"Stage {n}","조건":cond,f"{ticker} 비중":f"{target}%","현금":f"{cash}%"})
+        st.dataframe(pd.DataFrame(data),use_container_width=True,hide_index=True)
         st.info(f"버블보험: {ticker} 자체 200MA 대비 +{r['bubble']}% 이상 → 주식 비중 60% 수준.\n\n월중 즉시: {r['emergency_text']}")
 
 # ---------- Alerts ----------
@@ -376,8 +398,8 @@ elif page == "Alerts":
     alerts=[]
     for t,res in [("TQQQ",res_t),("SOXL",res_s)]:
         if res["bubble"]: alerts.append({"종류":"버블보험","ETF":t,"상태":"HIGH","내용":f"자체 200MA 대비 +{res['etf']['dist']:.2f}% 이상"})
-        if res["emergency"]==1: alerts.append({"종류":"월중 비상 1차","ETF":t,"상태":"HIGH","내용":"시장지수 200MA -1차 임계치 도달"})
-        if res["emergency"]==2: alerts.append({"종류":"월중 비상 2차","ETF":t,"상태":"CRITICAL","내용":"시장지수 200MA -2차 임계치 도달"})
+        if res["emergency"]==1: alerts.append({"종류":"월중 비상 1차","ETF":t,"상태":"HIGH","내용":"시장지수 200MA 1차 임계치 도달"})
+        if res["emergency"]==2: alerts.append({"종류":"월중 비상 2차","ETF":t,"상태":"CRITICAL","내용":"시장지수 200MA 2차 임계치 도달"})
         if res["stage"] in [2,3,4]: alerts.append({"종류":"단계 변경","ETF":t,"상태":"ACTION","내용":res["action"]})
     if alerts: st.dataframe(pd.DataFrame(alerts),use_container_width=True,hide_index=True)
     else: st.success("현재 활성화된 경보가 없습니다.")
@@ -385,9 +407,15 @@ elif page == "Alerts":
 # ---------- Settings ----------
 else:
     st.title("⚙️ Settings")
-    st.write("V1에서는 전략 규칙을 코드에 고정해 실수로 변경되지 않도록 했습니다.")
-    st.markdown("**데이터 저장 위치**")
-    st.code(str(DATA_DIR))
-    st.markdown("**점검 원칙**")
+    st.subheader("Supabase 연결 상태")
+    if supabase:
+        st.markdown('<div class="successbox"><b>연결 성공</b><br>계좌, 매매일지, 전략 스냅샷을 Supabase에 저장할 수 있습니다.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="errorbox"><b>연결 안 됨</b><br>Streamlit Cloud의 Secrets에 SUPABASE_URL과 SUPABASE_SERVICE_ROLE_KEY를 입력하세요.</div>', unsafe_allow_html=True)
+    st.subheader("Streamlit Secrets")
+    st.code('SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"\nSUPABASE_SERVICE_ROLE_KEY = "YOUR-SERVICE-ROLE-KEY"', language="toml")
+    st.warning("SERVICE_ROLE_KEY는 절대 GitHub 코드에 넣지 마세요. Streamlit Secrets에만 저장하세요.")
+    st.subheader("저장되는 데이터")
+    st.markdown("- **accounts**: TQQQ/SOXL 보유수량·평단가·현금\n- **trades**: 매수/매도·가격·수량·단계·이유\n- **snapshots**: 날짜별 시장상태·200MA·이격도·Stage·목표비중·판정근거")
+    st.subheader("점검 원칙")
     st.write("정상 상태는 2주마다 점검하고, 월중 비상 임계치 도달 시 즉시 대응합니다.")
-    st.warning("Streamlit Cloud에서 영구 저장이 필요하면 V2에서 Supabase 연결을 붙이는 것을 권장합니다.")
