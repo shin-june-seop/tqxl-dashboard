@@ -503,17 +503,46 @@ elif page == "Trade Journal":
 # ---------- Performance ----------
 elif page == "Performance":
     st.title("📊 Performance")
+    st.caption("실제 운용 성과는 초기 투자금 기준의 **계좌 수익률**을 사용합니다. ETF 가격 수익률은 보조 지표로 표시합니다.")
     if supabase is None:
         st.error("Supabase 연결 후 사용할 수 있습니다.")
     else:
         acct=load_accounts(); perf=[]
         for _,r in acct.iterrows():
-            t=r["etf"]; df=market_data.get(t,pd.DataFrame())
+            t=str(r["etf"]); df=market_data.get(t,pd.DataFrame())
             if df.empty: continue
-            cur=float(df["Close"].iloc[-1]); avg=float(r["avg_cost"]); shares=float(r["shares"]); pnl=(cur-avg)*shares; cost=avg*shares
-            perf.append({"ETF":t,"수익률":pnl/cost*100 if cost else 0,"평가손익":pnl,"평가액":cur*shares})
+            cur=float(df["Close"].iloc[-1])
+            avg=float(r.get("avg_cost",0) or 0)
+            shares=float(r.get("shares",0) or 0)
+            cash=float(r.get("cash",0) or 0)
+            initial=float(r.get("initial_investment",0) or 0)
+            market_value=cur*shares
+            account_value=market_value+cash
+            account_pnl=(account_value-initial) if initial>0 else 0.0
+            account_return=(account_pnl/initial*100) if initial>0 else 0.0
+            price_pnl=(cur-avg)*shares
+            price_return=(price_pnl/(avg*shares)*100) if avg>0 and shares>0 else 0.0
+            perf.append({
+                "ETF":t,
+                "계좌 수익률":account_return,
+                "ETF 가격 수익률":price_return,
+                "계좌 평가손익":account_pnl,
+                "계좌 평가액":account_value,
+                "초기 투자금":initial,
+                "현재가":cur,
+            })
         if perf:
-            p=pd.DataFrame(perf); st.dataframe(p,use_container_width=True,hide_index=True); st.bar_chart(p.set_index("ETF")["수익률"])
+            p=pd.DataFrame(perf)
+            display=p.copy()
+            for c in ["계좌 수익률","ETF 가격 수익률"]:
+                display[c]=display[c].map(lambda x:f"{x:+.2f}%")
+            for c in ["계좌 평가손익","계좌 평가액","초기 투자금","현재가"]:
+                display[c]=display[c].map(lambda x:money(x))
+            st.subheader("🎯 실제 운용 성과")
+            st.dataframe(display[["ETF","계좌 수익률","ETF 가격 수익률","계좌 평가손익","계좌 평가액","초기 투자금","현재가"]],use_container_width=True,hide_index=True)
+            st.info("계좌 수익률 = (현재 계좌 평가액 − 초기 투자금) ÷ 초기 투자금. 80%/20% 비중 조절을 포함한 실제 운용 성과이므로, ETF 가격 수익률과 차이가 나는 것이 정상입니다.")
+            chart=p.set_index("ETF")[["계좌 수익률","ETF 가격 수익률"]]
+            st.bar_chart(chart)
         snaps=db_select("snapshots",order=("snapshot_date",True))
         if not snaps.empty:
             st.subheader("📸 전략 스냅샷 기록")
