@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover
     create_client = None
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 CURRENCY = "USD"
 
 # Strategy: each ETF has its own budget and one-time staged purchase plan.
@@ -224,7 +224,7 @@ supabase, supabase_error = get_supabase()
 
 
 def db_get_config() -> dict[str, Any]:
-    default = {"id": "default", "total_budget": 10000.0}
+    default = {"id": "default", "total_budget": 10000.0, "spym_allocation_pct": 60.0}
     if supabase is None:
         return st.session_state.get("local_config", default)
     try:
@@ -238,8 +238,8 @@ def db_get_config() -> dict[str, Any]:
         return default
 
 
-def db_save_config(total_budget: float) -> bool:
-    payload = {"id": "default", "total_budget": float(total_budget), "updated_at": datetime.utcnow().isoformat()}
+def db_save_config(total_budget: float, spym_allocation_pct: float) -> bool:
+    payload = {"id": "default", "total_budget": float(total_budget), "spym_allocation_pct": float(spym_allocation_pct), "updated_at": datetime.utcnow().isoformat()}
     if supabase is None:
         st.session_state["local_config"] = payload
         return True
@@ -267,6 +267,7 @@ def db_save_state(ticker: str, state: dict[str, Any]) -> bool:
         "ticker": ticker,
         "tracking_start_date": state["tracking_start_date"],
         "triggered_stages": state.get("triggered_stages", []),
+        "skipped_stages": state.get("skipped_stages", []),
         "stage_trigger_dates": state.get("stage_trigger_dates", {}),
         "recovery_triggered": bool(state.get("recovery_triggered", False)),
         "recovery_date": state.get("recovery_date"),
@@ -331,7 +332,7 @@ def parse_date(value: Any, fallback: date) -> date:
 
 
 def evaluate_state(ticker: str, df: pd.DataFrame, saved: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Persist one-time drawdown triggers and first 20DMA reclaim after a trigger."""
+    """Persist one-time triggers. On first launch mid-drawdown, activate only the deepest current tranche."""
     rule = STRATEGIES[ticker]
     if df.empty:
         return {}, {"error": "가격 데이터 없음"}
@@ -350,28 +351,77 @@ def evaluate_state(ticker: str, df: pd.DataFrame, saved: dict[str, Any] | None) 
     if saved:
         tracking_start = parse_date(saved.get("tracking_start_date"), latest_date)
     else:
-        # On first launch, only recognize drawdown levels already reached as of the latest close.
         tracking_start = latest_date
 
-    # Rebuild stage dates from the split-normalized price history instead of blindly trusting
-    # persisted trigger flags. This also repairs stages falsely triggered by a split-price gap.
     monitor = drawdown.loc[drawdown.index.date >= tracking_start]
     triggered: set[str] = set()
+    skipped: set[str] = set(saved.get("skipped_stages", []) if saved else [])
     stage_dates: dict[str, str] = {}
+
+    # Reconstruct the first crossing for every unskipped tranche.
+    hit_by_stage: dict[str, str] = {}
     for stage in rule["stages"]:
         if stage["drawdown"] is None:
             continue
         key = stage["key"]
         hits = monitor[monitor <= float(stage["drawdown"]) + 1e-9]
         if not hits.empty:
-            triggered.add(key)
-            stage_dates[key] = hits.index[0].date().isoformat()
+            hit_by_stage[key] = hits.index[0].date().isoformat()
 
+    # Migration/initial-entry rule:
+    # If multiple thresholds were already crossed on the very first tracking day,
+    # do NOT retroactively buy every shallower tranche. Skip those and activate only
+    # the deepest threshold reached at startup (e.g. -35% => activate D3=15% only).
+    legacy_startup_batch = False
+    if saved:
+        old_dates = saved.get("stage_trigger_dates", {}) or {}
+        old_triggered = set(saved.get("triggered_stages", []) or [])
+        old_unique_dates = set(str(v) for k, v in old_dates.items() if k in old_triggered)
+        legacy_startup_batch = (
+            len(old_triggered) > 1
+            and len(old_unique_dates) == 1
+            and next(iter(old_unique_dates), "") == tracking_start.isoformat()
+            and not skipped
+        )
+
+    startup_batch = (not saved) or legacy_startup_batch
+    if startup_batch:
+        reached = [s for s in rule["stages"] if s["drawdown"] is not None and s["key"] in hit_by_stage]
+        if reached:
+            deepest = reached[-1]
+            for stage in reached:
+                key = stage["key"]
+                stage_dates[key] = hit_by_stage[key]
+                if key == deepest["key"]:
+                    triggered.add(key)
+                else:
+                    skipped.add(key)
+    else:
+        for stage in rule["stages"]:
+            if stage["drawdown"] is None:
+                continue
+            key = stage["key"]
+            if key in skipped:
+                if key in hit_by_stage:
+                    stage_dates[key] = hit_by_stage[key]
+                continue
+            if key in hit_by_stage:
+                triggered.add(key)
+                stage_dates[key] = hit_by_stage[key]
+
+    # Once the first active drawdown tranche has triggered, the first later 20DMA reclaim
+    # becomes the recovery tranche. A reclaim before the tracking start is not backfilled.
     recovery_triggered = False
     recovery_date = None
-    first_drawdown_dates = [pd.Timestamp(v) for k, v in stage_dates.items() if k != "RECOVERY"]
-    if first_drawdown_dates:
-        first_drawdown_date = min(first_drawdown_dates)
+    active_drawdown_dates = [pd.Timestamp(v) for k, v in stage_dates.items() if k in triggered and k != "RECOVERY"]
+    if saved and bool(saved.get("recovery_triggered", False)):
+        recovery_triggered = True
+        recovery_date = saved.get("recovery_date")
+        if recovery_date:
+            triggered.add("RECOVERY")
+            stage_dates["RECOVERY"] = str(recovery_date)
+    elif active_drawdown_dates:
+        first_drawdown_date = min(active_drawdown_dates)
         prev_close = close.shift(1)
         prev_sma = sma20.shift(1)
         reclaim = (close > sma20) & (prev_close <= prev_sma)
@@ -386,6 +436,7 @@ def evaluate_state(ticker: str, df: pd.DataFrame, saved: dict[str, Any] | None) 
     new_state = {
         "tracking_start_date": tracking_start.isoformat(),
         "triggered_stages": [s["key"] for s in rule["stages"] if s["key"] in triggered],
+        "skipped_stages": [s["key"] for s in rule["stages"] if s["key"] in skipped],
         "stage_trigger_dates": stage_dates,
         "recovery_triggered": recovery_triggered,
         "recovery_date": recovery_date,
@@ -409,6 +460,7 @@ def evaluate_state(ticker: str, df: pd.DataFrame, saved: dict[str, Any] | None) 
         "above_20": above_20,
         "previous_above_20": previous_above_20,
         "triggered": new_state["triggered_stages"],
+        "skipped": new_state["skipped_stages"],
         "stage_dates": stage_dates,
         "tracking_start": tracking_start,
         "max_drawdown_since_tracking": float(monitor.min()) if not monitor.empty else latest_dd,
@@ -440,11 +492,20 @@ def pct(value: float | None) -> str:
 
 # ----------------------------- Header / Sidebar -----------------------------
 
+config = db_get_config()
+raw_budget = config.get("total_budget", 10000.0)
+current_budget = float(10000.0 if raw_budget is None else raw_budget)
+raw_spym_pct = config.get("spym_allocation_pct", 60.0)
+current_spym_pct = float(60.0 if raw_spym_pct is None else raw_spym_pct)
+current_spym_pct = min(100.0, max(0.0, current_spym_pct))
+STRATEGIES["SPYM"]["allocation"] = current_spym_pct / 100.0
+STRATEGIES["SOXX"]["allocation"] = 1.0 - current_spym_pct / 100.0
+
 with st.sidebar:
     st.title("📈 SPYM + SOXX")
     st.caption(f"Split Buy Dashboard · v{APP_VERSION}")
     st.markdown("**전략 목표 비중**")
-    st.markdown("- SPYM 60%\n- SOXX 40%")
+    st.markdown(f"- SPYM {current_spym_pct:.0f}%\n- SOXX {100-current_spym_pct:.0f}%")
     if st.button("🔄 시장 데이터 새로고침", use_container_width=True):
         fetch_history.clear()
         st.rerun()
@@ -457,7 +518,7 @@ with st.sidebar:
 
 st.markdown(
     '<div class="hero"><h1>SPYM + SOXX 분할매수 대시보드</h1>'
-    '<p>SPYM 60% · SOXX 40% | 낙폭 단계별 매수 · 20일선 회복 매수 · 장기 보유</p></div>',
+    f'<p>SPYM {current_spym_pct:.0f}% · SOXX {100-current_spym_pct:.0f}% | 낙폭 단계별 매수 · 20일선 회복 매수 · 장기 보유</p></div>',
     unsafe_allow_html=True,
 )
 
@@ -476,19 +537,36 @@ if missing:
     st.error(f"가격 데이터를 가져오지 못했습니다: {', '.join(missing)}. 잠시 후 새로고침하거나 Yahoo Finance 데이터 상태를 확인하세요.")
     st.stop()
 
-# ----------------------------- Budget ---------------------------------------
-config = db_get_config()
-current_budget = float(config.get("total_budget", 10000.0) or 10000.0)
-with st.expander("⚙️ 투자 예산 설정", expanded=False):
-    st.caption("총 투자예산을 입력하면 SPYM 60%, SOXX 40%로 각 ETF의 분할매수 금액이 자동 계산됩니다. 통화는 USD입니다.")
-    b1, b2 = st.columns([2, 1])
+# ----------------------------- Budget / Allocation -------------------------
+with st.expander("⚙️ 투자 예산 및 목표 비중 설정", expanded=False):
+    st.caption("SPYM 비중을 바꾸면 SOXX 비중은 자동으로 나머지 비율이 됩니다. 변경은 향후 단계별 배정 금액에 반영되며, 이미 체결한 매수와 보유 수량은 그대로 유지됩니다. 통화는 USD입니다.")
+    b1, b2 = st.columns([1.5, 1])
     proposed_budget = b1.number_input("전체 투자예산 (USD)", min_value=0.0, value=current_budget, step=500.0, format="%.2f")
-    if b2.button("예산 저장", type="primary", use_container_width=True):
-        if db_save_config(proposed_budget):
-            st.success("투자예산을 저장했습니다.")
+    proposed_spym_pct = b2.slider("SPYM 목표 비중 (%)", min_value=0, max_value=100, value=int(round(current_spym_pct)), step=5)
+    st.info(f"목표 비중 미리보기: SPYM {proposed_spym_pct}% / SOXX {100-proposed_spym_pct}%")
+    if proposed_spym_pct != int(round(current_spym_pct)) or abs(proposed_budget - current_budget) > 0.001:
+        st.caption("현재 화면의 금액 계산에 미리보기가 반영되어 있습니다. 계속 사용하려면 '예산·비중 저장'을 눌러 주세요.")
+    if st.button("예산·비중 저장", type="primary", use_container_width=True):
+        validation_trades = db_get_trades()
+        spent = {t: trade_totals(validation_trades, t)["cost"] for t in STRATEGIES}
+        proposed_allocations = {
+            "SPYM": proposed_budget * proposed_spym_pct / 100.0,
+            "SOXX": proposed_budget * (100.0 - proposed_spym_pct) / 100.0,
+        }
+        conflicts = [
+            f"{t}: 이미 매수한 금액 {money(spent[t])} > 변경 후 배정액 {money(proposed_allocations[t])}"
+            for t in STRATEGIES if spent[t] > proposed_allocations[t] + 0.01
+        ]
+        if conflicts:
+            st.error("이미 체결한 매수 금액보다 ETF 배정 예산이 작아질 수 있어 저장하지 않았습니다. " + " / ".join(conflicts))
+        elif db_save_config(proposed_budget, proposed_spym_pct):
+            st.success(f"설정을 저장했습니다: SPYM {proposed_spym_pct}% / SOXX {100-proposed_spym_pct}%.")
             st.rerun()
 
 budget = float(proposed_budget if "proposed_budget" in locals() else current_budget)
+active_spym_pct = float(proposed_spym_pct if "proposed_spym_pct" in locals() else current_spym_pct)
+STRATEGIES["SPYM"]["allocation"] = active_spym_pct / 100.0
+STRATEGIES["SOXX"]["allocation"] = 1.0 - active_spym_pct / 100.0
 
 # ----------------------------- State update ---------------------------------
 states: dict[str, dict[str, Any]] = {}
@@ -570,7 +648,12 @@ for col, ticker in zip(card_cols, STRATEGIES):
     m = metrics[ticker]
     state = states[ticker]
     triggered_count = sum(1 for s in rule["stages"][:-1] if s["key"] in state["triggered_stages"])
+    skipped_count = sum(1 for s in rule["stages"][:-1] if s["key"] in state.get("skipped_stages", []))
+    reached_count = triggered_count + skipped_count
     due = sum(float(s["due_amount"]) for s in rule["stages"])
+    active_stage_defs = [s for s in rule["stages"][:-1] if s["key"] in state["triggered_stages"]]
+    active_stage_pct = sum(float(s["weight"]) * 100.0 for s in active_stage_defs)
+    active_stage_labels = ", ".join(s["label"] for s in active_stage_defs) or "없음"
     price_vs_20 = ((m["price"] / m["sma20"] - 1.0) * 100.0) if m["sma20"] else None
     col.markdown(f"""
     <div class="ticker-card">
@@ -579,7 +662,7 @@ for col, ticker in zip(card_cols, STRATEGIES):
       <div class="muted">기준일 {m['date']} · 전고점 {money(m['high_watermark'])}</div>
       <hr style="border-color:#35445a; margin:.65rem 0;">
       <div><b>고점 대비 낙폭</b> &nbsp; <span style="font-size:1.25rem;font-weight:700;">{m['drawdown']:.2f}%</span></div>
-      <div class="muted">현재 단계: 낙폭 매수 {triggered_count}/5 · 20일선 대비 {pct(price_vs_20)}</div>
+      <div class="muted">현재 단계: {reached_count}/5 도달 · 활성 {active_stage_labels} ({active_stage_pct:.0f}%) · 시작 전 생략 {skipped_count}단계 · 20일선 대비 {pct(price_vs_20)}</div>
       <div style="margin-top:.55rem;"><b>실행 대기 금액</b> &nbsp; <span style="font-size:1.3rem;font-weight:750;">{money(due)}</span></div>
       <div class="muted">배정 예산 {money(allocations[ticker])} · 누적 매수 {money(totals[ticker]['cost'])}</div>
     </div>
@@ -598,7 +681,9 @@ for ticker, rule in STRATEGIES.items():
             condition = "하락 단계 발생 후 종가가 20일선을 아래에서 위로 상향 돌파"
         else:
             condition = f"전고점 대비 {stage['drawdown']:.0f}% 이하"
-        if stage["triggered"]:
+        if stage["key"] in states[ticker].get("skipped_stages", []):
+            status = "시작 이전 통과 · 매수 생략"
+        elif stage["triggered"]:
             status = "매수 완료" if stage["remaining_amount"] <= 0.01 else ("부분 매수" if stage["purchased_amount"] > 0 else "매수 대기")
         else:
             status = "신호 대기"
@@ -725,7 +810,8 @@ with st.expander("📌 전략 규칙 및 계산 기준", expanded=False):
     st.markdown(
         """
         **목표 자산배분**
-        - SPYM 60%, SOXX 40%. 각 ETF의 분할매수 예산은 전체 예산에 이 비중을 곱해 계산합니다.
+        - 기본값은 SPYM 60%, SOXX 40%입니다. 투자 예산 및 목표 비중 설정에서 SPYM 목표 비중을 5%p 단위로 변경할 수 있으며 SOXX는 나머지 비중으로 자동 계산합니다.
+        - 비중 변경은 미래 단계별 배정 예산에 반영됩니다. 이미 체결한 매수 및 보유 수량은 유지되며, 이미 매수한 금액보다 낮아지는 배정 비중은 저장할 수 없습니다.
 
         **SPYM 분할매수**
         - -8%, -12%, -16%, -20%, -24%에서 각각 SPYM 배정 예산의 20%, 15%, 15%, 15%, 15%를 투입합니다.
@@ -737,7 +823,8 @@ with st.expander("📌 전략 규칙 및 계산 기준", expanded=False):
 
         **신호 및 보유 원칙**
         - 낙폭은 split-adjusted 종가의 누적 최고 종가 대비 하락률로 계산합니다. 당일 종가로 조건을 판정하고 실제 매수는 사용자가 증권사에서 실행합니다.
-        - 최초 실행 시점에는 현재 가격이 이미 임계값 아래라면 해당 단계들을 통과한 것으로 표시합니다. 이후 발생한 단계 신호는 Supabase에 저장되며, 가격이 반등해도 사라지지 않습니다.
+        - 최초 실행 시점에 현재 가격이 여러 임계값을 이미 통과했다면, 현재 낙폭 구간에 해당하는 가장 깊은 단계 하나만 매수 대상으로 활성화하고 그보다 얕은 단계는 '시작 이전 통과 · 매수 생략' 처리합니다. 예: SOXX를 -35%에서 처음 시작하면 -25%와 -30%는 생략하고 -35% 단계 15%만 활성화합니다.
+        - 대시보드 운용을 시작한 뒤 하루에 여러 임계값을 한꺼번에 통과하면, 아직 생략되지 않은 통과 단계들은 모두 활성화합니다. 이후 발생한 단계 신호는 Supabase에 저장되며, 가격이 반등해도 사라지지 않습니다.
         - 각 단계는 ETF별로 한 번만 사용합니다. 새 고점을 기록해도 사용한 단계 예산은 초기화하지 않습니다. 이는 매도 없이 예산을 한 번 배치하는 장기 보유형 규칙입니다.
         - 회복 매수는 하락 단계 이후 종가가 20일선을 아래에서 위로 교차한 경우에만 신호로 처리합니다. 첫 설치 이전에 발생한 과거 회복 교차는 소급하지 않습니다.
 
@@ -753,4 +840,4 @@ with st.expander("📌 전략 규칙 및 계산 기준", expanded=False):
     )
 
 st.caption(f"가격 데이터: {data_sources['SPYM']} / {data_sources['SOXX']} · 마지막 데이터: SPYM {metrics['SPYM']['date']} / SOXX {metrics['SOXX']['date']} · {CURRENCY}")
-st.caption("SPYM 60 : SOXX 40 · No 200-day moving-average sell rule · Buy-and-hold after each recorded purchase")
+st.caption(f"SPYM {active_spym_pct:.0f} : SOXX {100-active_spym_pct:.0f} · No 200-day moving-average sell rule · Buy-and-hold after each recorded purchase")
