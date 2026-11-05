@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover
     create_client = None
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CURRENCY = "USD"
 
 # Strategy: each ETF has its own budget and one-time staged purchase plan.
@@ -103,6 +103,63 @@ def _normalize_history(df: pd.DataFrame | None) -> pd.DataFrame:
     return out[~out.index.duplicated(keep="last")].sort_index()
 
 
+def _ensure_split_adjusted(df: pd.DataFrame, ticker: str) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize pre-split OHLC prices to the latest share unit when the feed leaves a split gap.
+
+    Yahoo data can temporarily mix pre-split historical closes with post-split current prices.
+    We detect this at each known/action-reported split by comparing the last pre-split close
+    with the first ex-split close. If the ratio is approximately the split ratio, historical
+    prices are divided and volume is multiplied. If the feed is already continuous, no change.
+    """
+    if df.empty:
+        return df, []
+    out = df.copy()
+    if ticker != "SOXX":
+        return out, []
+
+    events: dict[pd.Timestamp, float] = {
+        pd.Timestamp("2024-03-07"): 3.0,
+        pd.Timestamp("2026-11-05"): 3.0,
+    }
+    if "Stock Splits" in out.columns:
+        reported = pd.to_numeric(out["Stock Splits"], errors="coerce").fillna(0.0)
+        for d, ratio in reported[reported > 0].items():
+            events[pd.Timestamp(d).normalize()] = float(ratio)
+
+    notes: list[str] = []
+    price_cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close"] if c in out.columns]
+    for split_date, ratio in sorted(events.items()):
+        if ratio <= 1 or out.index.min() >= split_date or out.index.max() < split_date:
+            continue
+        post_dates = out.index[out.index >= split_date]
+        if len(post_dates) == 0:
+            continue
+        first_post = post_dates[0]
+        prior_dates = out.index[out.index < first_post]
+        if len(prior_dates) == 0:
+            continue
+        prev_close = float(out.loc[prior_dates[-1], "Close"])
+        post_close = float(out.loc[first_post, "Close"])
+        if prev_close <= 0 or post_close <= 0:
+            continue
+        observed_ratio = prev_close / post_close
+        # A split gap is present only when the market-price ratio is close to the
+        # corporate-action ratio. Ordinary price fluctuations must not trigger adjustment.
+        if ratio * 0.75 <= observed_ratio <= ratio * 1.25:
+            mask = out.index < first_post
+            out.loc[mask, price_cols] = out.loc[mask, price_cols].apply(pd.to_numeric, errors="coerce") / ratio
+            if "Volume" in out.columns:
+                out.loc[mask, "Volume"] = pd.to_numeric(out.loc[mask, "Volume"], errors="coerce") * ratio
+            notes.append(f"{split_date.date()} {ratio:g}:1 split 전 가격을 분할 후 기준으로 환산")
+        elif 0.75 <= observed_ratio <= 1.25:
+            notes.append(f"{split_date.date()} {ratio:g}:1 split은 데이터에 이미 반영됨")
+        else:
+            notes.append(
+                f"{split_date.date()} split 조정 상태 불확실(전후 가격비 {observed_ratio:.2f}, 예상 {ratio:g}); 자동 조정하지 않음"
+            )
+    return out, notes
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_history(ticker: str) -> tuple[pd.DataFrame, str]:
     """Fetch split-adjusted daily OHLC data. SPYM falls back to legacy SPLG history."""
@@ -137,7 +194,11 @@ def fetch_history(ticker: str) -> tuple[pd.DataFrame, str]:
         return pd.DataFrame(), "SPYM 및 과거 티커 SPLG 데이터를 가져오지 못했습니다."
 
     data = get_one(ticker)
-    return data, "Yahoo Finance · split-adjusted Close"
+    data, split_notes = _ensure_split_adjusted(data, ticker)
+    source = "Yahoo Finance · split 단위 검증 후 가격 정규화"
+    if split_notes:
+        source += " · " + " / ".join(split_notes)
+    return data, source
 
 
 # ----------------------------- Supabase -------------------------------------
@@ -288,21 +349,15 @@ def evaluate_state(ticker: str, df: pd.DataFrame, saved: dict[str, Any] | None) 
     latest_date = close.index[-1].date()
     if saved:
         tracking_start = parse_date(saved.get("tracking_start_date"), latest_date)
-        triggered = set(saved.get("triggered_stages") or [])
-        stage_dates = dict(saved.get("stage_trigger_dates") or {})
-        recovery_triggered = bool(saved.get("recovery_triggered", False))
-        recovery_date = saved.get("recovery_date")
     else:
         # On first launch, only recognize drawdown levels already reached as of the latest close.
-        # Future historical scanning begins from this date so old, unrelated recovery crosses
-        # are not imported into a newly started strategy.
         tracking_start = latest_date
-        triggered = set()
-        stage_dates = {}
-        recovery_triggered = False
-        recovery_date = None
 
+    # Rebuild stage dates from the split-normalized price history instead of blindly trusting
+    # persisted trigger flags. This also repairs stages falsely triggered by a split-price gap.
     monitor = drawdown.loc[drawdown.index.date >= tracking_start]
+    triggered: set[str] = set()
+    stage_dates: dict[str, str] = {}
     for stage in rule["stages"]:
         if stage["drawdown"] is None:
             continue
@@ -310,12 +365,12 @@ def evaluate_state(ticker: str, df: pd.DataFrame, saved: dict[str, Any] | None) 
         hits = monitor[monitor <= float(stage["drawdown"]) + 1e-9]
         if not hits.empty:
             triggered.add(key)
-            stage_dates.setdefault(key, hits.index[0].date().isoformat())
+            stage_dates[key] = hits.index[0].date().isoformat()
 
-    # A recovery tranche is triggered by a close crossing from at/below the 20DMA to above it,
-    # after at least one drawdown tranche has triggered during this dashboard's tracking period.
+    recovery_triggered = False
+    recovery_date = None
     first_drawdown_dates = [pd.Timestamp(v) for k, v in stage_dates.items() if k != "RECOVERY"]
-    if first_drawdown_dates and not recovery_triggered:
+    if first_drawdown_dates:
         first_drawdown_date = min(first_drawdown_dates)
         prev_close = close.shift(1)
         prev_sma = sma20.shift(1)
@@ -411,6 +466,10 @@ with st.spinner("SPYM과 SOXX의 최신 일별 가격 데이터를 확인하고 
     data_sources: dict[str, str] = {}
     for ticker in STRATEGIES:
         market_data[ticker], data_sources[ticker] = fetch_history(ticker)
+
+with st.expander("데이터 출처 및 분할 조정 점검", expanded=False):
+    for ticker in STRATEGIES:
+        st.caption(f"{ticker}: {data_sources[ticker]}")
 
 missing = [t for t, df in market_data.items() if df.empty]
 if missing:
